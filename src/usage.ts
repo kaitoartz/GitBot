@@ -198,8 +198,13 @@ export function accumulateUsage(
   liveTotals.set(gitbotId, current);
   // The window reflects the newest message, not the sum of all turns. A
   // subagent's message does not fill the parent's window, so it opts out.
+  // Same formula as OpenCode's own TUI/context meter: everything the provider
+  // reports for that message, including its output and reasoning.
   if (options.updateWindow !== false) {
-    lastWindowUsed.set(gitbotId, delta.input + delta.cacheRead + delta.cacheWrite);
+    lastWindowUsed.set(
+      gitbotId,
+      delta.input + delta.output + delta.reasoning + delta.cacheRead + delta.cacheWrite,
+    );
   }
 }
 
@@ -268,7 +273,9 @@ async function sumHistoricalUsage(
   return total;
 }
 
-/** The window usage of the final assistant message in this thread. */
+/** The window usage of the final assistant message in this thread. Mirrors
+ *  OpenCode's own meter: input + output + reasoning + cache read/write of the
+ *  newest assistant message that produced output. */
 async function lastMessageWindowUsed(
   client: any,
   sdkSessionId: string,
@@ -282,8 +289,10 @@ async function lastMessageWindowUsed(
       if (messageId && excludeMessageIds?.has(messageId)) continue;
       if (msg.info?.role !== "assistant") continue;
       const snapshot = parseUsageFromMessage(msg);
-      if (snapshot && snapshot.total > 0) {
-        return snapshot.input + snapshot.cacheRead + snapshot.cacheWrite;
+      if (snapshot && snapshot.output > 0) {
+        return (
+          snapshot.input + snapshot.output + snapshot.reasoning + snapshot.cacheRead + snapshot.cacheWrite
+        );
       }
     }
   } catch {}
@@ -313,9 +322,9 @@ export function getCombinedTotal(storeKeyOrGitbotId: string, threadKey?: string)
  * Session-scoped usage report: combined total + resolved context window.
  * `threadKey` is the `thread:<id>` key the REST endpoint's seed lives under —
  * omit for a fresh session with no seed. The window is the newest assistant
- * message's footprint (input + cacheRead + cacheWrite, input excludes cache
- * on v1) — each turn re-reads the cache, so the cross-turn sum is not what
- * fills the window.
+ * message's full token count (input + output + reasoning + cache read/write),
+ * the number OpenCode itself reports. Each turn re-sends the cached history,
+ * so the cross-turn sum is not what fills the window.
  */
 export function buildSessionReport(
   store: Pick<SessionStore, "gitbotId"> & { model?: string },

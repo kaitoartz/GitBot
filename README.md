@@ -150,7 +150,9 @@ An **Allowed tools** list limits which tools a bot can use; its permission mode 
 
 ## Security and privacy
 
-> **Important:** GitBot has no authentication and listens on all network interfaces. Anyone who can reach its port can run agents using your machine's access. Use a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it.
+> **Important:** GitBot has no authentication and listens on all network interfaces. Anyone who can reach its port can run agents using your machine's access. Use a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it. If you need access from outside your network, put an authenticating layer in front (for example Cloudflare Access, a private Tailscale network, or a playit.gg tunnel plus its access controls) and treat the URL as a password.
+
+If the startup QR does not open on your phone, the printed address probably belongs to a virtual adapter (WSL, Hyper-V, Docker, a VPN). GitBot now prints the other local addresses too; pick the one that starts with `192.168.`, `10.` or `172.16-31.` and matches your Wi-Fi. Also allow Node.js on **Private** networks in Windows Defender Firewall, and make sure the router is not blocking device-to-device traffic.
 
 Bots act with your user account's file and shell access. Auto-approval removes a chance to inspect individual tool calls. Imported bots may include setup instructions that run when imported, so read them and their permission mode first.
 
@@ -164,7 +166,29 @@ GitBot has no account, telemetry, or hosted database. Bots and thread records li
 gitbot start                 # use port 3000
 gitbot start -p 4000         # choose another port
 gitbot start --caffeinate    # keep a Mac awake during long jobs
+gitbot start --public-url https://example.trycloudflare.com
+                             # QR for a tunnel instead of the LAN address
 ```
+
+## Access outside your network
+
+GitBot only prints the QR for an address; the tunnel is a separate process you control. Two options:
+
+**playit.gg** (already installed): create a tunnel for TCP `localhost:3000`, keep the playit agent running, then start GitBot with the address it gives you:
+
+```bash
+gitbot start --public-url https://your-name.playit.gg
+```
+
+**Cloudflare Tunnel** (quick test, no account):
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+# copy the printed https://....trycloudflare.com URL
+gitbot start --public-url https://....trycloudflare.com
+```
+
+Quick tunnels are random and unauthenticated. For daily use, create a named Cloudflare Tunnel with **Cloudflare Access** on the hostname, or use Tailscale and pass its IP/URL. Never leave a bare tunnel open: anyone with the URL can run commands on your machine.
 
 The folder where you run `gitbot start` becomes the workspace shown first in the folder picker. A thread can still run in another folder you can read.
 

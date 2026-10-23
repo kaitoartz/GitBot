@@ -79,8 +79,10 @@ export default function UsageBar({ threadId, sessionId, agent, streaming }: Usag
             if (!prev) return prev;
             const u = prev.usage;
             const d = event.usage;
-            // The turn's footprint is the newest window state (see usage doc).
-            const windowUsed = d.input + d.cacheRead + d.cacheWrite;
+            // The turn's footprint is the newest window state: OpenCode's own
+            // formula, including the message's output and reasoning.
+            const windowUsed =
+              d.input + d.output + d.reasoning + d.cacheRead + d.cacheWrite;
             return {
               ...prev,
               usage: {
@@ -130,9 +132,19 @@ export default function UsageBar({ threadId, sessionId, agent, streaming }: Usag
   return (
     <div className="usage-bar">
       <div className="usage-bar-compact">
-        {context && context.limit != null && (
-          <span className="usage-bar-context" style={{ color: contextColor }}>
-            contexto {context.pct}% · {formatTokens(context.used)}/{formatTokens(context.limit)}
+        {context && context.used > 0 && (
+          <span
+            className="usage-bar-context"
+            style={{ color: contextColor }}
+            title={
+              context.limit != null
+                ? `Ventana de contexto actual del modelo: ${context.used.toLocaleString()} de ${context.limit.toLocaleString()} tokens (${context.pct}% usado, ${Math.max(0, 100 - (context.pct ?? 0))}% libre). No es el total acumulado del hilo.`
+                : `Ventana de contexto actual: ${context.used.toLocaleString()} tokens. El modelo no informa su limite.`
+            }
+          >
+            contexto{context.limit != null ? ` ${context.pct}% · ` : " "}
+            {formatTokens(context.used)}
+            {context.limit != null ? `/${formatTokens(context.limit)}` : ""}
           </span>
         )}
         {turnTotal && turnTotal.total > 0 && (
@@ -179,6 +191,28 @@ export default function UsageBar({ threadId, sessionId, agent, streaming }: Usag
           <div className="usage-bar-row">
             <span className="usage-bar-label">Cache write</span>
             <span>{formatTokens(sessionTotal.cacheWrite)}</span>
+          </div>
+          {context && context.limit != null && (
+            <>
+              <div className="usage-bar-row">
+                <span className="usage-bar-label">Contexto usado</span>
+                <span>
+                  {formatTokens(context.used)} ({context.pct}%)
+                </span>
+              </div>
+              <div className="usage-bar-row">
+                <span className="usage-bar-label">Contexto libre</span>
+                <span>{formatTokens(Math.max(0, context.limit - context.used))}</span>
+              </div>
+              <div className="usage-bar-row">
+                <span className="usage-bar-label">Limite del modelo</span>
+                <span>{formatTokens(context.limit)}</span>
+              </div>
+            </>
+          )}
+          <div className="usage-bar-row">
+            <span className="usage-bar-label">Tokens acumulados del hilo</span>
+            <span>{formatTokens(sessionTotal.total)}</span>
           </div>
           <div className="usage-bar-row">
             <span className="usage-bar-label">Costo por turno</span>

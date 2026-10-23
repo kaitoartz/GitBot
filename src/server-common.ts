@@ -55,16 +55,42 @@ export function findAvailablePort(startPort: number, endPort: number): Promise<n
   });
 }
 
-export function getLocalIP(): string {
+// Adapters that exist on the machine but are not reachable from a phone on the
+// same Wi-Fi: WSL, Hyper-V, Docker, VPNs. Picking one makes the startup QR scan
+// into a dead URL, which is the classic "same network, page does not load".
+const VIRTUAL_ADAPTER =
+  /(vEthernet|WSL|Docker|Hyper-V|Loopback|Tailscale|ZeroTier|VMware|VirtualBox|TAP-|Hamachi|WireGuard|NordLynx|utun)/i;
+
+/** Score a LAN address: home routers first, CG-NAT/internal last. */
+function lanScore(address: string): number {
+  if (/^192\.168\./.test(address)) return 5;
+  if (/^10\./.test(address)) return 4;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) return 3;
+  if (/^169\.254\./.test(address)) return 0; // link-local: never useful
+  return 1;
+}
+
+/** Every non-internal IPv4 with the most likely LAN address first. */
+export function getLocalIPs(): { name: string; address: string }[] {
   const nets = networkInterfaces();
+  const found: { name: string; address: string; score: number }[] = [];
   for (const name of Object.keys(nets)) {
     for (const net of nets[name]!) {
-      if (net.family === "IPv4" && !net.internal) {
-        return net.address;
-      }
+      if (net.family !== "IPv4" || net.internal) continue;
+      if (net.address.startsWith("127.")) continue;
+      found.push({
+        name,
+        address: net.address,
+        score: lanScore(net.address) + (VIRTUAL_ADAPTER.test(name) ? -10 : 0),
+      });
     }
   }
-  return "localhost";
+  found.sort((a, b) => b.score - a.score || a.address.localeCompare(b.address));
+  return found.map(({ name, address }) => ({ name, address }));
+}
+
+export function getLocalIP(): string {
+  return getLocalIPs()[0]?.address ?? "localhost";
 }
 
 export function getPublicIP(): Promise<string | null> {
@@ -92,8 +118,9 @@ export function getTailscaleIP(): Promise<string | null> {
 }
 
 export async function showQR(network: string, port: number): Promise<void> {
-  let ip: string;
+  let url: string;
   let label: string;
+  let alternatives: string[] = [];
 
   if (network === "tailscale") {
     const tsIP = await getTailscaleIP();
@@ -101,7 +128,7 @@ export async function showQR(network: string, port: number): Promise<void> {
       console.error("  Tailscale IP not found. Is Tailscale running?");
       process.exit(1);
     }
-    ip = tsIP;
+    url = `http://${tsIP}:${port}`;
     label = "Tailscale";
   } else if (network === "remote-ip") {
     const publicIP = await getPublicIP();
@@ -109,18 +136,40 @@ export async function showQR(network: string, port: number): Promise<void> {
       console.error("  Could not determine public IP address.");
       process.exit(1);
     }
-    ip = publicIP;
+    url = `http://${publicIP}:${port}`;
     label = "Public";
   } else if (network === "local") {
-    ip = getLocalIP();
+    const ips = getLocalIPs();
+    const ip = ips[0]?.address ?? "localhost";
+    url = `http://${ip}:${port}`;
     label = "Local Network";
+    // Other adapters are printed so a wrong guess is visible and fixable
+    // instead of silently producing a QR that does not open.
+    alternatives = ips
+      .slice(1)
+      .filter((candidate) => !VIRTUAL_ADAPTER.test(candidate.name))
+      .map((candidate) => `http://${candidate.address}:${port}  (${candidate.name})`);
+  } else if (/^https?:\/\//i.test(network)) {
+    url = network.replace(/\/+$/, "");
+    label = "Public URL";
   } else {
-    ip = network;
+    url = `http://${network}:${port}`;
     label = "Custom";
   }
 
-  const url = `http://${ip}:${port}`;
   console.log(`\n  ${label}  ${url}\n`);
+  if (alternatives.length > 0) {
+    console.log("  Other local addresses:");
+    for (const alt of alternatives) console.log(`    ${alt}`);
+    console.log("");
+  }
+  if (label === "Local Network" && process.platform === "win32") {
+    console.log(
+      "  Phone cannot connect? Allow Node.js on Private networks in Windows Defender Firewall,\n" +
+        "  and check the router is not using AP/client isolation. For access outside the house\n" +
+        "  use --public-url with a tunnel (playit.gg or Cloudflare Tunnel).\n"
+    );
+  }
 
   const qrCode = await new Promise<string>((resolve) => {
     qrcode.generate(url, { small: true }, (code: string) => {
