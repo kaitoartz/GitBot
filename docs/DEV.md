@@ -63,6 +63,20 @@ npm run dev        # next dev, apunta al server de GitBot
 
 Cuando el cambio está listo, `npm run build` desde la raíz para que quede en `dist/ui`.
 
+### Pruebas de adjuntos (Fase 2)
+
+```bash
+npm run build:cli                            # el test del server lee dist/
+node --test scripts/attachments.test.mjs     # validación, MIME, FilePart
+node --test ui/scripts/attachments.test.mjs  # @menciones y tipos
+
+# turno real contra un `gitbot start` aislado (data dir temporal, puerto 3100)
+node scripts/smoke-attachments.mjs
+```
+
+El spike S1 (`scripts/spikes/opencode-file-parts.mjs`) sigue disponible para
+reprobar qué forma de `FilePartInput` acepta un server nuevo.
+
 ---
 
 ## 3. Datos y respaldos

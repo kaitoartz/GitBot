@@ -1,6 +1,6 @@
 import { existsSync } from "fs";
 import { mkdir, readdir, stat, readFile as fsReadFile } from "fs/promises";
-import { join, resolve, extname } from "path";
+import { join, resolve, extname, relative, isAbsolute } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 
@@ -94,13 +94,28 @@ export interface DirEntry {
   size: number | null;
 }
 
-// List entries in dirPath, validated to be inside repoRoot
-export async function listDir(dirPath: string, repoRoot: string): Promise<DirEntry[]> {
-  const resolvedDir = resolve(dirPath);
+/**
+ * Resolve `target` and prove it lives inside `repoRoot`. `relative` (not a
+ * string prefix) so `C:\repo-evil` cannot pass as `C:\repo`.
+ */
+export function resolveInsideRepo(target: string, repoRoot: string): string {
+  const resolvedTarget = resolve(target);
   const resolvedRoot = resolve(repoRoot);
-  if (!resolvedDir.startsWith(resolvedRoot)) {
+  const rel = relative(resolvedRoot, resolvedTarget);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
     throw new Error("Path is outside the selected repository");
   }
+  return resolvedTarget;
+}
+
+/** Repo-relative path with forward slashes, for `@mentions` and display. */
+export function repoRelative(target: string, repoRoot: string): string {
+  return relative(resolve(repoRoot), resolve(target)).split("\\").join("/");
+}
+
+// List entries in dirPath, validated to be inside repoRoot
+export async function listDir(dirPath: string, repoRoot: string): Promise<DirEntry[]> {
+  const resolvedDir = resolveInsideRepo(dirPath, repoRoot);
   const entries = await readdir(resolvedDir, { withFileTypes: true });
   const result: DirEntry[] = [];
   for (const entry of entries) {
@@ -121,11 +136,7 @@ export async function listDir(dirPath: string, repoRoot: string): Promise<DirEnt
 
 // Read a file, validated to be inside repoRoot; enforces 5 MB max
 export async function readFile(filePath: string, repoRoot: string): Promise<{ content: string; size: number }> {
-  const resolvedFile = resolve(filePath);
-  const resolvedRoot = resolve(repoRoot);
-  if (!resolvedFile.startsWith(resolvedRoot)) {
-    throw new Error("Path is outside the selected repository");
-  }
+  const resolvedFile = resolveInsideRepo(filePath, repoRoot);
   const s = await stat(resolvedFile);
   const MAX_SIZE = 5 * 1024 * 1024;
   if (s.size > MAX_SIZE) {

@@ -30,7 +30,7 @@ import { loadTranscript } from "./start-claude-code";
 import { loadTranscript as loadCodexTranscript } from "./start-codex";
 import { getSessionHistory as loadOpencodeHistory } from "./start-opencode";
 import { getOpencodeClientForDir } from "./start-opencode";
-import { buildSessionReport, loadHistoricalUsage, isSeeded, liveMessageIdsOf } from "./usage";
+import { buildSessionReport, loadHistoricalUsage, isSeeded, liveMessageIdsOf, getModelInfo } from "./usage";
 
 /**
  * REST surface for the bot hub: bots, their threads, and a thread's messages.
@@ -48,6 +48,48 @@ export async function handleBotRoutes(
   const method = req.method ?? "GET";
   const path = url.split("?")[0];
   const query = parseQuery(url);
+
+  // --- Files (composer @mentions) ---
+
+  // GET /files/search?repoPath=&q= — fuzzy file search inside a repo, backed
+  // by OpenCode's own /find/file. Paths come back repo-relative, ready to be
+  // inserted as an `@mention`. Degrades to an empty list when the server
+  // cannot answer, so the composer simply shows no suggestions.
+  if (method === "GET" && path === "/files/search") {
+    const repoPath = query.repoPath;
+    const q = (query.q ?? "").trim();
+    if (!repoPath) { jsonError(res, 400, "repoPath is required"); return true; }
+    if (q.length < 2) { jsonOk(res, { files: [] }); return true; }
+    try {
+      const client = await getOpencodeClientForDir(repoPath);
+      const result = await client.find.files({
+        query: { directory: repoPath, query: q, dirs: "false" },
+      });
+      const files = (Array.isArray(result.data) ? result.data : [])
+        .filter((p: unknown): p is string => typeof p === "string" && !!p && !p.startsWith("/") && !p.split(/[\\/]/).includes(".."))
+        .slice(0, 20)
+        .map((p: string) => ({ path: p, name: p.split("/").pop() ?? p }));
+      jsonOk(res, { files });
+    } catch (err: any) {
+      console.warn("[files] search failed:", err?.message);
+      jsonOk(res, { files: [] });
+    }
+    return true;
+  }
+
+  // GET /models/capabilities?model=provider/model — what the model can take.
+  // Phase 2 gates the composer's clip on `image` / `pdf`; Phase 4 reads
+  // `variants`. `known:false` means the provider list has not loaded (yet):
+  // the UI offers the control and lets the server reject if it must.
+  if (method === "GET" && path === "/models/capabilities") {
+    const model = query.model ?? "";
+    const slash = model.indexOf("/");
+    if (slash === -1) { jsonError(res, 400, "model must be provider/model"); return true; }
+    const info = getModelInfo(model.slice(0, slash), model.slice(slash + 1));
+    if (!info) { jsonOk(res, { model, known: false }); return true; }
+    jsonOk(res, { model, known: true, ...info });
+    return true;
+  }
 
   // --- Bots ---
 

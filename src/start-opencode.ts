@@ -17,7 +17,9 @@ import {
   buildTurnReport,
   buildSessionReport,
   accumulateUsage,
+  getModelInfo,
 } from "./usage";
+import { filePartFor, mentionText } from "./attachments";
 
 async function loadOpencodeSdk() {
   const sdk = await import("@opencode-ai/sdk");
@@ -247,7 +249,16 @@ async function getClientForDir(directory: string): Promise<any> {
 export async function runAgent(store: SessionStore): Promise<void> {
   const lastUserEvent = [...store.events].reverse().find(e => e.type === "user_prompt");
   const prompt = (lastUserEvent?.prompt as string) ?? "";
-  const attachments = lastUserEvent?.attachments as Array<{ url: string }> | undefined;
+  // Bytes live on the store (never in the SSE event). The legacy `{ url }`
+  // shape is still honoured for callers that post attachments directly; the
+  // new metadata-only event shape has no `url` and must not become a part.
+  const pending = store.pendingAttachments ?? [];
+  const legacyAttachments = ((lastUserEvent?.attachments as Array<{ url?: string }> | undefined) ?? [])
+    .filter((a) => typeof a?.url === "string" && a.url);
+  const mentions = mentionText(pending);
+  // Consume the bytes now: they are either attached to this turn or dropped by
+  // a failure below. A long-lived session map must not retain megabytes.
+  store.pendingAttachments = undefined;
   (store as any)._msgRoles = new Map<string, string>();
   store.lastTaskToolUseId = undefined;
 
@@ -259,8 +270,9 @@ export async function runAgent(store: SessionStore): Promise<void> {
 
     if (!store.sdkSessionId) {
       const repoName = basename(store.repoPath);
+      const firstLine = prompt || mentionText(pending);
       const sessionResult = await client.session.create({
-        body: { title: `[${repoName}] ${prompt.slice(0, 60) || (attachments?.length ? "Image message" : "New chat")}` },
+        body: { title: `[${repoName}] ${firstLine.slice(0, 60) || (pending.length || legacyAttachments.length ? "Attachment message" : "New chat")}` },
         query: { directory: store.repoPath },
       });
       const sdkId = (sessionResult.data as any).id as string;
@@ -290,13 +302,30 @@ export async function runAgent(store: SessionStore): Promise<void> {
     // tools the Claude Code way ("Bash"); OpenCode's ids are lowercase.
     const tools = await presetTools(client, store);
 
+    // Gate binaries on what the model actually declares. Unknown capabilities
+    // (older providers, no cache) degrade to "try it" rather than blocking.
+    const binary = pending.filter((a) => a.kind === "image");
+    if (binary.length && modelParam) {
+      const info = getModelInfo(modelParam.providerID, modelParam.modelID);
+      const images = binary.filter((a) => a.mime.startsWith("image/"));
+      const pdfs = binary.filter((a) => a.mime === "application/pdf");
+      if (info && images.length && !info.image) {
+        throw new Error(`Model ${store.model} does not accept image attachments`);
+      }
+      if (info && pdfs.length && !info.pdf) {
+        throw new Error(`Model ${store.model} does not accept PDF attachments`);
+      }
+    }
+    const fileParts = await Promise.all(binary.map(filePartFor));
+
     // Use promptAsync so the request returns immediately; completion signaled via event stream
     const promptResult = await client.session.promptAsync({
       path: { id: store.sdkSessionId! },
       body: {
         parts: [
-          ...(prompt ? [{ type: "text" as const, text: prompt }] : []),
-          ...(attachments?.map(att => ({ type: "file" as const, mime: "image/jpeg", url: att.url })) ?? []),
+          ...(prompt || mentions ? [{ type: "text" as const, text: [prompt, mentions].filter(Boolean).join("\n\n") }] : []),
+          ...fileParts,
+          ...legacyAttachments.map(att => ({ type: "file" as const, mime: "image/jpeg", url: att.url })),
         ],
         ...(modelParam ? { model: modelParam } : {}),
         ...(store.mode ? { agent: store.mode } : {}),
@@ -307,8 +336,14 @@ export async function runAgent(store: SessionStore): Promise<void> {
       },
     });
     if (promptResult.error) {
-      const errMsg = (promptResult.error as any)?.detail || (promptResult.error as any)?.message || "Prompt failed";
-      console.error("[query] promptAsync error:", errMsg);
+      // The SDK wraps server errors as { name, data: { message, kind } }.
+      const errObj: any = promptResult.error;
+      const errMsg =
+        errObj?.data?.message ||
+        errObj?.message ||
+        errObj?.detail ||
+        (typeof errObj === "string" ? errObj : "Prompt failed");
+      console.error("[query] promptAsync error:", errMsg, JSON.stringify(errObj).slice(0, 500));
       emitEvent(store, "agent_error", { message: errMsg });
       // The turn never started, so no idle event will follow: close the stream.
       emitEvent(store, "error", { message: errMsg });
@@ -377,8 +412,14 @@ export async function getSessionHistory(sdkSessionId: string, directory: string 
         const blocks: any[] = [];
         for (const p of parts) {
           if (p.type === "text" && p.text) blocks.push({ type: "text", text: p.text });
-          else if (p.type === "file" && p.url) blocks.push({ type: "image_url", url: p.url });
-          else if (p.type === "tool") {
+          else if (p.type === "file" && p.url) {
+            blocks.push({
+              type: String(p.mime ?? "").startsWith("image/") ? "image_url" : "file",
+              url: p.url,
+              ...(p.filename ? { name: p.filename } : {}),
+              ...(p.mime ? { mime: p.mime } : {}),
+            });
+          } else if (p.type === "tool") {
             const toolName = p.tool ?? "";
             const input = p.state?.input;
             let tool_input: string;

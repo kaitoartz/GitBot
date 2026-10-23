@@ -84,8 +84,19 @@ export function browse(path?: string | null) {
  *  modes as-is, plus "plan" — yolo with the agent held to planning. */
 export type ChatPermissionMode = SessionPermissionMode | "plan";
 
+/** One attachment as `POST /chat` takes it. Text/code uses `path` (a mention);
+ *  images and PDFs carry their bytes as a base64 data URL. */
+export type ChatAttachment =
+  | { kind: "path"; path: string }
+  | { kind: "image"; name: string; mime: string; dataUrl: string };
+
 /** Starts a turn. Returns the session id to stream + abort + approve on. */
-export function postChat(threadId: string, prompt: string, permissionMode: ChatPermissionMode) {
+export function postChat(
+  threadId: string,
+  prompt: string,
+  permissionMode: ChatPermissionMode,
+  attachments?: ChatAttachment[],
+) {
   return req<{ sessionId: string }>("/chat", {
     method: "POST",
     body: JSON.stringify({
@@ -93,8 +104,32 @@ export function postChat(threadId: string, prompt: string, permissionMode: ChatP
       prompt,
       permissionMode: permissionMode === "plan" ? "yolo" : permissionMode,
       mode: permissionMode === "plan" ? "plan" : "build",
+      ...(attachments?.length ? { attachments } : {}),
     }),
   });
+}
+
+/** Fuzzy file search inside a repo for the composer's `@` picker. */
+export function searchFiles(repoPath: string, q: string) {
+  return req<{ files: { path: string; name: string }[] }>(
+    `/files/search?repoPath=${encodeURIComponent(repoPath)}&q=${encodeURIComponent(q)}`,
+  );
+}
+
+export type ModelCapabilities = {
+  model: string;
+  known: boolean;
+  image?: boolean;
+  pdf?: boolean;
+  reasoning?: boolean;
+  variants?: string[];
+};
+
+/** What the model accepts (clip gating). `known:false` = provider list not loaded. */
+export function getModelCapabilities(model: string) {
+  return req<ModelCapabilities>(
+    `/models/capabilities?model=${encodeURIComponent(model)}`,
+  );
 }
 
 export function patchPermissionMode(sessionId: string, permissionMode: SessionPermissionMode) {

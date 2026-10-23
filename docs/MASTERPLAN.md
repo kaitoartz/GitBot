@@ -168,6 +168,16 @@ Dos caminos, porque adjuntar código y adjuntar una imagen no son el mismo probl
 - Archivo fuera de `repoPath` → rechazado con mensaje claro.
 - Modelo sin visión → clip deshabilitado, no error en runtime.
 
+**Estado: completada.** Resultados:
+
+- **S1 resuelto en vivo:** `FilePartInput.url` es obligatorio y acepta data URLs base64 (imagen, PDF, texto); `source` sin `url` da `400`, y una ruta Windows pelada cuelga el turno. El server arma siempre el data URL él mismo. Spike: `scripts/spikes/opencode-file-parts.mjs`.
+- `src/attachments.ts`: validación única antes del turno — `kind:"path"` (mención `@relativa`), `kind:"image"` (data URL del cliente o archivo del repo leído por el server), solo `image/*` y `application/pdf`, tope 10 MB, y toda ruta confinada al repo con `relative()` (no prefijo de string). Los bytes viven en `SessionStore.pendingAttachments`; el evento `user_prompt` lleva solo metadatos (`kind`, `name`, `mime`, `size`, `path`) para no meter MB en el SSE.
+- Driver OpenCode: las menciones se anexan al texto; las imágenes/PDF van como `FilePartInput` con MIME real. Guard de capacidades (`capabilities.input.image|pdf`) antes de `promptAsync`, con error claro si el modelo no acepta el binario. El historial devuelve bloques `image_url` / `file` con `name` y `mime`.
+- `GET /files/search?repoPath=&q=` envuelve `client.find.files` (20 resultados, rutas relativas) y degrada a `{ files: [] }`. `GET /models/capabilities?model=` expone `image`, `pdf`, `reasoning`, `variants`, `limit`.
+- UI: clip (picker), drag-drop sobre el composer y paste de imágenes; chips con nombre/tamaño/quitar; autocomplete `@` con búsqueda difusa, navegación por teclado y `Tab`/`Enter`; adjuntos visibles en la burbuja y en el historial. Clip deshabilitado si el modelo no declara ni imagen ni PDF; con un turno corriendo se pide esperar en vez de perder los archivos en la cola de texto.
+- Tests: `scripts/attachments.test.mjs` (validación/MIME/FilePart) y `ui/scripts/attachments.test.mjs` (menciones y tipos); `scripts/smoke-attachments.mjs` para el turno real.
+- **Pendiente de aceptación manual:** ver el clip, el drag-drop y el `@` en el navegador con un turno real.
+
 ---
 
 ### Fase 3 — Subagentes en vivo
@@ -273,6 +283,7 @@ El SDK 1.2.15 todavía no tipa `variant` (sus `types.gen.d.ts` no lo incluyen), 
 |---|---|---|
 | `GET` | `/threads/:id/usage` | 1 |
 | `GET` | `/files/search?repoPath=&q=` | 2 |
+| `GET` | `/models/capabilities?model=` | 2 |
 | `POST` | `/chat` (amplía `attachments`) | 2 |
 | `GET` | `/subagents/:childSessionId/messages` | 3 |
 | `GET` | `/agents` (perfiles disponibles) | 4 |
@@ -294,7 +305,7 @@ Bot    { ..., profile?: string }
 |---|---|---|---|
 | **S0** | ¿El SDK 1.2.15 habla bien con el server de OpenCode? | **Sí, contra v1.19.3.** Turno completo: `session.create` → `promptAsync` → eventos → `session.idle`. **v2.0.29 no sirve:** API nueva bajo `/api` con password; el SDK y GitBot esperan v1. El server v1 ahora lo arranca GitBot si no hay uno (Fase 0). | 0 ✅ |
 | **S2** | ¿`message.updated` trae tokens durante el turno o sólo al final? | **Sólo al final.** Primer update del assistant con `tokens` en cero; el snapshot real llega en `step-finish` (~4 s en un turno corto). `input` excluye cache; `total = input + output + cache.read + cache.write`. `limit.context` se lee de `config.providers()`. | 1 ✅ |
-| **S1** | ¿Qué forma de `FilePartInput` acepta el server para imagen / PDF / texto? | **Parcial (schema).** `{ type:"file", mime, url, source? }`, con `source = { text, type:"file", path }` para archivo local. Falta probar en vivo si lee la ruta del disco y si exige `text`. | 2 |
+| **S1** | ¿Qué forma de `FilePartInput` acepta el server para imagen / PDF / texto? | **Resuelto en vivo (v1.19.3).** `url` es obligatorio: `source` solo (sin `url`) da `400 Missing key ["url"]`. Acepta data URLs base64 para imagen, PDF y texto, y **normaliza** `file:///...` a data URL. Una ruta Windows pelada como `url` **no falla**: el turno queda colgado (`session.error` sin idle), por eso el server siempre arma el data URL él mismo. El part se guarda tal cual en `session.messages` (con `filename` y `mime`). | 2 ✅ |
 | **S3** | ¿El part `task` expone el `sessionId` del hijo en metadata? | Pendiente. Requiere un turno que dispare subagente; el spike deja el volcado crudo en `.spike-opencode/`. | 3 |
 | **S4** | ¿`variant` en el body cambia el razonamiento y aplica desde el próximo mensaje? | Pendiente. El OpenAPI confirma que `variant` es un campo válido del body, y los modelos declaran `variants` (`low`/`high`/`max`). Falta verificar efecto real y herencia a subagentes. | 4 |
 
@@ -324,6 +335,7 @@ Vuelca cada evento crudo a `.spike-opencode/events-<timestamp>.jsonl` (ignorado 
 | R4 | `npm link` deja el `gitbot` global apuntando al clone roto | alto (día a día) | `npm run check` antes de build; `git stash`/`checkout` para volver; reinstalar global como plan B |
 | R5 | Cambios en `threads.json` rompen hilos existentes | medio | Campos opcionales + backup en Fase 0 + lectura tolerante |
 | R6 | UI sin store: props cada vez más profundas | bajo-medio | Componentes nuevos con props explícitas; no introducir context global salvo que duela |
+| R7 | **Bug abierto:** el indicador `Thinking…` no se apaga aunque el agente ya respondió | medio: la UI miente sobre el estado del turno | Reproducir con el SSE a la vista y confirmar si falta `session.idle` o llega un `status:"thinking"` tardío; recién entonces tocar `src/start-opencode.ts`. No bloquea Fase 2 |
 
 ---
 
@@ -332,8 +344,8 @@ Vuelca cada evento crudo a `.spike-opencode/events-<timestamp>.jsonl` (ignorado 
 | Fase | Esfuerzo | Valor | Depende de |
 |---|---|---|---|
 | 0 Higiene | 0.5 sesión | base | — **hecha** |
-| 1 Uso/contexto | 1–1.5 sesiones | **alto** | 0, S2 |
-| 2 Archivos | 1.5 sesiones | **alto** | 0, S1 |
+| 1 Uso/contexto | 1–1.5 sesiones | **alto** | 0, S2 — **hecha** |
+| 2 Archivos | 1.5 sesiones | **alto** | 0, S1 — **hecha** |
 | 3 Subagentes | 1.5–2 sesiones | alto | 1 (para costo por hijo), S3 |
 | 4 Perfiles | 1 sesión | medio | 0, S4 |
 | 5 Orquestador | 3+ sesiones | opcional | 1–4 |

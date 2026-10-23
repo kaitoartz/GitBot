@@ -241,6 +241,9 @@ export interface SessionStore {
   // Bot hub: the thread this session belongs to, and the preset driving it.
   threadId?: string;
   botPreset?: BotPreset;
+  // Attachments for the turn about to run. Kept off the SSE event (which
+  // carries only metadata) so a multi-MB data URL never reaches every client.
+  pendingAttachments?: import("./attachments").PendingAttachment[];
 }
 
 /** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */

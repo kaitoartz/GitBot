@@ -32,6 +32,7 @@ import { handleBotRoutes } from "./bot-routes";
 import { handleMarketplaceRoutes } from "./marketplace-proxy";
 import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BOT_AGENT } from "./bot-store";
 import { botPermissionToSession } from "./server-common";
+import { resolveAttachments, publicAttachment, mentionText, filePartFor, type PendingAttachment } from "./attachments";
 import { uiFileFor } from "./static-ui";
 
 export async function handleRequest(
@@ -286,11 +287,11 @@ export async function handleRequest(
       }
 
       if (!repoPath) { jsonError(res, 400, "repoPath is required"); return; }
-      if (!prompt && (!attachments || attachments.length === 0)) {
+      if (!prompt && (!Array.isArray(attachments) || attachments.length === 0)) {
         jsonError(res, 400, "prompt or attachments is required"); return;
       }
-      if (attachments != null && (!Array.isArray(attachments) || attachments.some((a: any) => typeof a?.url !== "string" || !a.url))) {
-        jsonError(res, 400, "attachments must be an array of { url: string }"); return;
+      if (attachments != null && !Array.isArray(attachments)) {
+        jsonError(res, 400, "attachments must be an array"); return;
       }
       if (agent !== "claude-code" && agent !== "opencode" && agent !== "codex") {
         jsonError(res, 400, "agent must be claude-code, opencode, or codex");
@@ -301,7 +302,33 @@ export async function handleRequest(
         return;
       }
 
+      // Validate every attachment before a session is touched: outside-repo
+      // paths, unsupported types and oversized binaries fail with a 400 the
+      // composer can show, not a half-started turn.
+      let pendingAttachments: PendingAttachment[] = [];
+      try {
+        pendingAttachments = await resolveAttachments(attachments, repoPath);
+      } catch (err: any) {
+        jsonError(res, 400, err?.message ?? "Invalid attachments");
+        return;
+      }
+      const attachmentMeta = pendingAttachments.map(publicAttachment);
+
       let store = existingId ? sessions.get(existingId) : undefined;
+
+      // The event is the client-visible contract (metadata only); the bytes
+      // ride on the store. Claude Code / Codex keep their legacy `{ url }`
+      // shape so nothing changes for them.
+      const userPrompt = agent === "opencode"
+        ? (prompt ?? "")
+        : [prompt, mentionText(pendingAttachments)].filter(Boolean).join("\n\n");
+      const storedAttachments = agent === "opencode"
+        ? attachmentMeta
+        : await Promise.all(
+            pendingAttachments
+              .filter((a) => a.kind === "image")
+              .map(async (a) => ({ url: a.dataUrl ?? (await filePartFor(a)).url })),
+          );
 
       if (store) {
         if (store.status === "running") {
@@ -316,14 +343,16 @@ export async function handleRequest(
         if (mode) store.mode = mode;
         if (permissionMode) store.permissionMode = permissionMode as PermissionMode;
         if (threadId) { store.threadId = threadId; store.botPreset = botPreset; }
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
+        store.pendingAttachments = pendingAttachments;
+        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
       } else {
         const gitbotId = existingId ?? randomUUID();
         store = createSession(gitbotId, agent, repoPath, model, mode, permissionMode as PermissionMode | undefined, { threadId, preset: botPreset });
         if (existingId) {
           store.sdkSessionId = existingId;
         }
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
+        store.pendingAttachments = pendingAttachments;
+        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
         notifyPermissionsChanged();
       }
 

@@ -38,10 +38,30 @@ Cambios de este fork sobre `gitbot-hq/GitBot` 0.0.9. El upstream no se toca: `ma
 - La ventana de contexto es el footprint del último mensaje assistant (`input + cacheRead + cacheWrite`), no el sumatorio de turnos: cada turno relee el cache y el sumatorio no representa el estado de la ventana.
 - El costo refleja lo reporte el proveedor; varios devuelven `0`.
 
+### Fase 2 — Adjuntar archivos
+
+**Agregado**
+
+- `src/attachments.ts`: validación y normalización de adjuntos antes de arrancar el turno. `kind:"path"` → mención `@ruta` en el texto (OpenCode la resuelve); `kind:"image"` → `FilePartInput` real con data URL. Solo imágenes y PDF, 10 MB, rutas confinadas al repo.
+- `GET /files/search?repoPath=&q=` (búsqueda difusa vía `client.find.files`) y `GET /models/capabilities?model=` (imagen/PDF/variantes/límites).
+- UI del composer: clip, drag-drop, paste de imágenes, chips con nombre/tamaño/quitar y autocomplete `@` con teclado. El clip se deshabilita si el modelo no declara imagen ni PDF.
+- Burbujas e historial renderizan los adjuntos (`image_url` / `file`), releídos del transcript de OpenCode.
+- `scripts/spikes/opencode-file-parts.mjs` (S1), `scripts/attachments.test.mjs`, `ui/scripts/attachments.test.mjs` y `scripts/smoke-attachments.mjs`.
+
+**Notas**
+
+- `FilePartInput` exige `url`; `source` sin `url` da 400 y una ruta Windows pelada cuelga el turno. El server siempre arma el data URL.
+- El evento `user_prompt` lleva metadatos, nunca los bytes: los adjuntos viven en memoria del store durante el turno.
+- Con un turno corriendo, adjuntar pide esperar: la cola sigue siendo solo texto y no debe perder archivos en silencio.
+
+### Bugs conocidos
+
+- **Thinking infinito tras responder.** En uso real el agente ya mostró su respuesta y la UI sigue con el indicador `Thinking…` animando. Sospecha: el turno no recibe/cierra su `done` (¿falta `session.idle` para esa sesión, o llega un `status:"thinking"` tardío?). No se pudo capturar el SSE concreto (los intentos de diagnóstico se interrumpieron). No bloquea Fase 2; hay que reproducirlo con la pestaña Network abierta antes de tocar `start-opencode.ts`.
+
 ### Pendiente
 
 - Aceptación manual de la barra de uso en el navegador (colores, conectividad en vivo).
-- Fase 2: adjuntar archivos desde el panel.
+- Aceptación manual de Fase 2 en el navegador (clip, drag-drop, `@`).
 - Fase 3: subagentes en vivo.
 - Fase 4: variante de razonamiento por mensaje.
 - Fase 5 (opcional): orquestador que delega a otros bots.

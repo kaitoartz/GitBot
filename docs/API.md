@@ -25,6 +25,8 @@ The workspace is the directory `gitbot start` was run in. Repos are its subdirec
 | `POST` | `/folders` | Create an empty folder in the workspace. Body: `{ name }`. Returns `{ path, name }` |
 | `GET` | `/browse?path=<dir>` | Folder picker. Returns `{ path, parent, workspace, home, dirs: { name, path }[] }`. `parent` is `null` at the filesystem root. Without `path` it starts at the workspace. Not confined to the workspace: it lists folders anywhere the gitbot process can read |
 | `GET` | `/dir?repoPath=<path>&path=<subpath>` | Directory entries inside a repo. The path is validated to stay inside `repoPath` |
+| `GET` | `/files/search?repoPath=<path>&q=<query>` | Fuzzy file search inside a repo (OpenCode's `/find/file`), for the composer's `@` picker. Returns `{ files: { path, name }[] }`, `path` repo-relative, at most 20. Queries shorter than 2 chars and server errors answer `{ files: [] }` |
+| `GET` | `/models/capabilities?model=<provider/model>` | What the model accepts: `{ model, known, image, pdf, reasoning, variants, limit }`. `known: false` means the provider list has not loaded yet |
 | `GET` | `/file?repoPath=<path>&path=<filePath>` | Read a file. Validated to stay inside `repoPath`. 5 MB max |
 | `GET` | `/diffs?repoPath=<path>` | `{ diff }` — the output of `git diff HEAD` |
 
@@ -74,7 +76,7 @@ A thread is one conversation between a bot and a folder.
 
 A thread records `agent` and `sdkSessionId` on its first turn and keeps them: a session id only means something to the agent that issued it. Other fields: `kind` (`chat` \| `setup`), `title`, `repoPath`, `preview`, `messageCount`, `createdAt`, `updatedAt`.
 
-Messages are `{ role: "user" | "assistant", content: Block[] }`, where a block is `{ type: "text", text }`, `{ type: "tool_use", tool_name, tool_input }` or `{ type: "image_url", url }`.
+Messages are `{ role: "user" | "assistant", content: Block[] }`, where a block is `{ type: "text", text }`, `{ type: "tool_use", tool_name, tool_input }`, `{ type: "image_url", url, name?, mime? }` or `{ type: "file", url, name?, mime? }` (PDFs and other file parts). `url` is a data URL when the agent stored the bytes.
 
 ## Chat
 
@@ -87,7 +89,27 @@ Two body forms:
 - **Thread turn** (what the hub uses): `{ threadId, prompt, permissionMode? }`. The thread supplies the folder, the agent, the resume handle and the bot's preset.
 - **Bare session:** `{ repoPath, agent, prompt, sessionId?, model?, permissionMode? }`. Pass `sessionId` to continue an earlier session.
 
-Both accept `attachments: { url }[]`. Session `permissionMode` values are `ask-permissions`, `allow-all-edits` and `yolo`.
+Both accept `attachments`. Session `permissionMode` values are `ask-permissions`, `allow-all-edits` and `yolo`.
+
+**Attachments** describe files that ride with the message. Two shapes:
+
+```json
+{ "kind": "path", "path": "src/usage.ts" }
+{ "kind": "image", "name": "shot.png", "mime": "image/png", "dataUrl": "data:image/png;base64,..." }
+```
+
+- `kind: "path"` is a text/code reference. The server validates it lives inside
+  the thread's `repoPath` and appends `@<relative/path>` to the prompt; OpenCode
+  resolves the mention itself. No bytes enter the prompt.
+- `kind: "image"` sends a real `FilePartInput`. `dataUrl` may be replaced by a
+  `path` inside `repoPath`; the server reads the file. Only `image/*` and
+  `application/pdf` are accepted, up to 10 MB each. The turn is rejected before
+  it starts when the model declares that input unsupported.
+- Legacy `{ url }` is still accepted for images.
+
+The `user_prompt` event carries only metadata (`kind`, `name`, `mime`, `size`,
+and `path` for mentions), never the data URL. The visible history comes back
+from the agent transcript.
 
 Errors: `400` with `{ agentUnavailable: "<agent>" }` when the bot's agent is not installed; `409` with `{ setupRequired: true }` when the bot still needs setup; `409` when that session is already running.
 

@@ -75,39 +75,69 @@ const liveMessageIds = new Map<string, Set<string>>();
 // Context limits: providerID/modelID → token limit (null = unknown).
 let contextLimitsCache: Map<string, number | null> | null = null;
 
+// What a model can take and how it thinks, straight from config.providers().
+// Phase 2 uses `input.image` / `input.pdf` to gate the composer's clip;
+// Phase 4 will read `variants`. Null while the cache has not loaded.
+export interface ModelInfo {
+  image: boolean;
+  pdf: boolean;
+  reasoning: boolean;
+  variants: string[];
+  limit: { context: number | null; output: number | null };
+}
+
+let modelInfoCache: Map<string, ModelInfo> | null = null;
+
 /**
- * Initialize the context limits cache from OpenCode's config.providers().
+ * Initialize the model caches from OpenCode's config.providers().
  * Call once when the OpenCode server is ready.
  */
 export async function initContextLimits(client: any): Promise<void> {
   const cache = new Map<string, number | null>();
+  const info = new Map<string, ModelInfo>();
   try {
     const result = await client.config.providers();
     const providers = result.data?.providers ?? [];
     for (const provider of providers) {
       const models = provider.models ?? [];
-      if (Array.isArray(models)) {
-        for (const model of models) {
-          if (!model?.id) continue;
-          cache.set(`${provider.id}/${model.id}`, model?.limit?.context ?? null);
-        }
-      } else {
-        // Record form: models keyed by model id.
-        for (const [key, model] of Object.entries<any>(models)) {
-          cache.set(`${provider.id}/${model?.id ?? key}`, model?.limit?.context ?? null);
-        }
+      const entries: [string, any][] = Array.isArray(models)
+        ? models.filter((m: any) => m?.id).map((m: any) => [m.id, m])
+        : Object.entries<any>(models).map(([key, model]) => [model?.id ?? key, model]);
+      for (const [key, model] of entries) {
+        const id = `${provider.id}/${key}`;
+        cache.set(id, model?.limit?.context ?? null);
+        info.set(id, {
+          image: model?.capabilities?.input?.image === true,
+          // OpenCode calls it `input.pdf`; older builds only expose `attachment`.
+          pdf:
+            model?.capabilities?.input?.pdf === true ||
+            (model?.capabilities?.input?.pdf == null && model?.capabilities?.attachment === true),
+          reasoning: model?.capabilities?.reasoning === true,
+          variants: Object.keys(model?.variants ?? {}),
+          limit: {
+            context: model?.limit?.context ?? null,
+            output: model?.limit?.output ?? null,
+          },
+        });
       }
     }
   } catch (err: any) {
-    console.warn("[usage] failed to load context limits:", err.message);
+    console.warn("[usage] failed to load model info:", err.message);
   }
   contextLimitsCache = cache;
+  modelInfoCache = info;
 }
 
 /** Context limit for providerID/modelID; null when unknown (UI hides the pct). */
 export function getContextLimit(providerID: string, modelID: string): number | null {
   if (!contextLimitsCache) return null;
   return contextLimitsCache.get(`${providerID}/${modelID}`) ?? null;
+}
+
+/** Capabilities for providerID/modelID; null when the provider list is not loaded. */
+export function getModelInfo(providerID: string, modelID: string): ModelInfo | null {
+  if (!modelInfoCache) return null;
+  return modelInfoCache.get(`${providerID}/${modelID}`) ?? null;
 }
 
 /** Normalize an OpenCode message into a usage snapshot; null without token data. */

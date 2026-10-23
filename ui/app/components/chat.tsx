@@ -16,6 +16,8 @@ import { PencilIcon } from "@animateicons/react/lucide/pencil-icon";
 import { ZapIcon } from "@animateicons/react/lucide/zap-icon";
 import { FileTextIcon } from "@animateicons/react/lucide/file-text-icon";
 import { ChevronDownIcon } from "@animateicons/react/lucide/chevron-down-icon";
+import { PaperclipIcon } from "@animateicons/react/lucide/paperclip-icon";
+import { XIcon } from "@animateicons/react/lucide/x-icon";
 
 import { Children, Fragment, isValidElement, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
@@ -27,6 +29,7 @@ import BotName from "./bot-name";
 import {
   ApiError,
   getMessages,
+  getModelCapabilities,
   getPendingPermissions,
   getSessionConfig,
   getSessionStatus,
@@ -34,9 +37,24 @@ import {
   postAbort,
   postChat,
   postPermission,
+  searchFiles,
   streamUrl,
+  type ChatAttachment,
   type ChatPermissionMode,
+  type ModelCapabilities,
 } from "../lib/api";
+import {
+  applyMention,
+  attachmentId,
+  attachmentKindFor,
+  ATTACHMENT_MAX_BYTES,
+  formatBytes,
+  MAX_ATTACHMENTS,
+  mentionQueryAt,
+  mimeForFilename,
+  readFileAsDataUrl,
+  type PendingAttachment,
+} from "../lib/attachments";
 import { EDIT_TOOLS, type HistoryMsg, type PermRequest, type ThreadFull } from "../lib/gitbot";
 import type { AvatarPref } from "../lib/avatar-prefs";
 import { useMascotPointerFollow } from "../lib/use-mascot-pointer-follow";
@@ -55,10 +73,13 @@ import UsageBar from "./usage-bar";
 type Seg =
   | { kind: "text"; text: string }
   | { kind: "tools"; tools: ToolChip[] };
+/** A file part that rode with a message: an image preview or a PDF chip. */
+type FileChip = { name: string; mime: string; url: string };
 type Msg = {
   id: string;
   role: "user" | "assistant";
   segs: Seg[];
+  attachments?: FileChip[];
   retryPrompt?: string;
   /** End-of-turn receipt (client-side overlay, see below). */
   summary?: { secs: number; stopped: boolean };
@@ -73,9 +94,18 @@ const nid = () => `m${Date.now()}-${seq++}`;
 // it isn't user chat.
 function flatten(
   role: string,
-  content: { type: string; text?: string; tool_name?: string; tool_input?: unknown }[],
-): { role: "user" | "assistant"; segs: Seg[] } {
+  content: {
+    type: string;
+    text?: string;
+    tool_name?: string;
+    tool_input?: unknown;
+    url?: string;
+    name?: string;
+    mime?: string;
+  }[],
+): { role: "user" | "assistant"; segs: Seg[]; attachments: FileChip[] } {
   const segs: Seg[] = [];
+  const attachments: FileChip[] = [];
   const pushText = (text: string) => {
     const last = segs[segs.length - 1];
     if (last && last.kind === "text") last.text += `\n\n${text}`;
@@ -95,14 +125,48 @@ function flatten(
       pushText(b.text as string);
     } else if (b.type === "tool_use" && b.tool_name) {
       pushTool(String(b.tool_name), b.tool_input);
+    } else if ((b.type === "image_url" || b.type === "file") && b.url) {
+      attachments.push({
+        name: b.name ?? (b.type === "image_url" ? "image" : "attachment"),
+        mime: b.mime ?? (b.type === "image_url" ? "image/*" : "application/pdf"),
+        url: b.url,
+      });
     }
   }
-  return { role: role === "user" ? "user" : "assistant", segs };
+  return { role: role === "user" ? "user" : "assistant", segs, attachments };
 }
 
 function errText(e: unknown) {
   if (e instanceof ApiError) return e.message;
   return e instanceof Error ? e.message : "Something went wrong";
+}
+
+/** Image previews and PDF chips attached to a message (live or history). */
+function MessageAttachments({ files }: { files: FileChip[] }) {
+  if (!files.length) return null;
+  return (
+    <div className="msg-attachments">
+      {files.map((f, i) =>
+        f.mime.startsWith("image/") ? (
+          <figure key={`${f.name}-${i}`} className="msg-attachment image">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={f.url} alt={f.name} title={f.name} />
+          </figure>
+        ) : (
+          <a
+            key={`${f.name}-${i}`}
+            className="msg-attachment file"
+            href={f.url}
+            download={f.name}
+            title={`Download ${f.name}`}
+          >
+            <AnimatedActionIcon icon={FileTextIcon} size={16} aria-hidden="true" />
+            <span>{f.name}</span>
+          </a>
+        ),
+      )}
+    </div>
+  );
 }
 
 // Assistant markdown (GFM). Raw HTML is off by default — no XSS surface.
@@ -368,6 +432,7 @@ export default function Chat({
   botName,
   botPermissionMode,
   botAgent,
+  botModel,
   botAvatar,
   autoSend,
   onAutoSent,
@@ -386,6 +451,8 @@ export default function Chat({
   botName: string;
   botPermissionMode?: string;
   botAgent?: string;
+  /** OpenCode model of this bot ("provider/model"); gates the clip. */
+  botModel?: string;
   botAvatar?: AvatarPref;
   autoSend: string | null;
   onAutoSent: () => void;
@@ -426,6 +493,20 @@ export default function Chat({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copyErrorId, setCopyErrorId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const attachmentsRef = useRef<PendingAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
+  const [mention, setMention] = useState<{
+    start: number;
+    end: number;
+    query: string;
+    items: { path: string; name: string }[];
+    index: number;
+  } | null>(null);
+  const mentionTimer = useRef<number | null>(null);
   const [escapeStopArmed, setEscapeStopArmed] = useState(false);
   const [activeMenu, setActiveMenu] = useState<"share" | "more" | "permissions" | null>(null);
   const setShareOpen = useCallback((open: boolean) => setActiveMenu(open ? "share" : null), []);
@@ -642,18 +723,19 @@ export default function Chat({
     };
     const out: Msg[] = [];
     messages.forEach((m) => {
-      const { role, segs } = flatten(m.role, m.content);
-      if (segs.length === 0) return;
+      const { role, segs, attachments } = flatten(m.role, m.content);
+      if (segs.length === 0 && attachments.length === 0) return;
       const prev = out[out.length - 1];
       const target =
         prev && prev.role === role
-          ? prev.segs
+          ? prev
           : (() => {
-              const fresh: Seg[] = [];
-              out.push({ id: `h${out.length}`, role, segs: fresh });
+              const fresh: Msg = { id: `h${out.length}`, role, segs: [] };
+              out.push(fresh);
               return fresh;
             })();
-      for (const s of segs) pushSeg(target, s);
+      if (attachments.length) target.attachments = [...(target.attachments ?? []), ...attachments];
+      for (const s of segs) pushSeg(target.segs, s);
     });
     // Drop whitespace-only text; drop messages left with nothing.
     for (const m of out) {
@@ -661,7 +743,7 @@ export default function Chat({
         (s) => s.kind === "tools" || s.text.trim().length > 0,
       );
     }
-    const visible = out.filter((m) => m.segs.length > 0);
+    const visible = out.filter((m) => m.segs.length > 0 || (m.attachments?.length ?? 0) > 0);
     visible.forEach((m, i) => {
       if (m.role === "assistant" && visible[i - 1]?.role === "user") {
         m.retryPrompt = msgText(visible[i - 1]);
@@ -682,6 +764,9 @@ export default function Chat({
     liveIdRef.current = null;
     liveTextRef.current = "";
     turnActiveRef.current = false;
+    setPendingAttachments([]);
+    setMention(null);
+    setAttachError(null);
     if (stopTimer.current) {
       window.clearTimeout(stopTimer.current);
       stopTimer.current = null;
@@ -1051,15 +1136,166 @@ export default function Chat({
     });
   }
 
+  function setPendingAttachments(next: PendingAttachment[]) {
+    attachmentsRef.current = next;
+    setAttachments(next);
+  }
+
+  // Before the provider list loads, offer the clip (degrade to the server's
+  // rejection). Once it says "no images and no PDFs", remove the affordance.
+  const clipAllowed =
+    agent === "opencode" &&
+    !(capabilities?.known && capabilities.image === false && capabilities.pdf === false);
+
+  async function addFiles(list: FileList | File[] | null) {
+    const files = Array.from(list ?? []);
+    if (!files.length) return;
+    if (streaming || turnActiveRef.current) {
+      setAttachError("Wait for this turn to finish, then attach files.");
+      return;
+    }
+    const room = MAX_ATTACHMENTS - attachmentsRef.current.length;
+    if (room <= 0) {
+      setAttachError(`Up to ${MAX_ATTACHMENTS} attachments per message.`);
+      return;
+    }
+    const errors: string[] = [];
+    const accepted: PendingAttachment[] = [];
+    for (const file of files.slice(0, room)) {
+      const kind = attachmentKindFor(file);
+      if (!kind) {
+        errors.push(`${file.name}: only images and PDFs attach. Use @ to reference code files.`);
+        continue;
+      }
+      if (capabilities?.known) {
+        if (kind === "image" && capabilities.image === false) {
+          errors.push(`${file.name}: this model does not accept images.`);
+          continue;
+        }
+        if (kind === "pdf" && capabilities.pdf === false) {
+          errors.push(`${file.name}: this model does not accept PDFs.`);
+          continue;
+        }
+      }
+      if (file.size > ATTACHMENT_MAX_BYTES) {
+        errors.push(`${file.name}: ${formatBytes(file.size)} exceeds the ${formatBytes(ATTACHMENT_MAX_BYTES)} limit.`);
+        continue;
+      }
+      try {
+        accepted.push({
+          id: attachmentId(),
+          kind,
+          name: file.name,
+          mime: file.type || mimeForFilename(file.name),
+          size: file.size,
+          dataUrl: await readFileAsDataUrl(file),
+        });
+      } catch {
+        errors.push(`${file.name}: could not be read.`);
+      }
+    }
+    if (files.length > room) errors.push(`Only ${MAX_ATTACHMENTS} attachments per message.`);
+    if (accepted.length) setPendingAttachments([...attachmentsRef.current, ...accepted]);
+    setAttachError(errors.length ? errors.join(" ") : null);
+  }
+
+  function removeAttachment(id: string) {
+    setPendingAttachments(attachmentsRef.current.filter((a) => a.id !== id));
+    setAttachError(null);
+  }
+
+  /** Recompute the active `@token` from the textarea after typing or moving. */
+  function refreshMention() {
+    const box = boxRef.current;
+    if (!box || !thread) {
+      setMention(null);
+      return;
+    }
+    const found = mentionQueryAt(box.value, box.selectionStart ?? 0);
+    if (!found) {
+      setMention(null);
+      return;
+    }
+    setMention((prev) =>
+      prev && prev.start === found.start && prev.query === found.query
+        ? prev
+        : { ...found, items: [], index: 0 },
+    );
+  }
+
+  function pickMention(item: { path: string }) {
+    if (!mention) return;
+    const current = boxRef.current?.value ?? draftRef.current;
+    const next = applyMention(current, mention.start, mention.end, item.path);
+    setDraft(next.text);
+    draftRef.current = next.text;
+    if (threadRef.current) drafts.current[threadRef.current] = next.text;
+    setMention(null);
+    requestAnimationFrame(() => {
+      const box = boxRef.current;
+      if (box) {
+        box.focus();
+        box.setSelectionRange(next.caret, next.caret);
+        fitBox();
+      }
+    });
+  }
+
+  // Search files for the open `@token` (debounced).
+  useEffect(() => {
+    if (!mention || !thread) return;
+    const q = mention.query;
+    const repoPath = thread.repoPath;
+    if (mentionTimer.current) window.clearTimeout(mentionTimer.current);
+    mentionTimer.current = window.setTimeout(() => {
+      mentionTimer.current = null;
+      searchFiles(repoPath, q)
+        .then(({ files }) => {
+          setMention((prev) =>
+            prev && prev.query === q ? { ...prev, items: files, index: 0 } : prev,
+          );
+        })
+        .catch(() => {
+          setMention((prev) => (prev && prev.query === q ? { ...prev, items: [] } : prev));
+        });
+    }, 140);
+    return () => {
+      if (mentionTimer.current) window.clearTimeout(mentionTimer.current);
+      mentionTimer.current = null;
+    };
+  }, [mention?.query, thread?.id]);
+
+  // The clip is only honest for OpenCode + a model that declares vision/PDF.
+  useEffect(() => {
+    setCapabilities(null);
+    if (agent !== "opencode" || !botModel) return;
+    let cancelled = false;
+    getModelCapabilities(botModel)
+      .then((caps) => {
+        if (!cancelled) setCapabilities(caps);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [agent, botModel]);
+
   // The composer never locks: sending mid-turn parks the message in the
   // queue (flushed by finish()), sending while idle starts a turn.
   async function sendPrompt(prompt: string) {
-    if (!thread || !prompt.trim()) return;
+    const pending = attachmentsRef.current;
+    if (!thread || (!prompt.trim() && pending.length === 0)) return;
     if (streaming || turnActiveRef.current) {
+      // Queued messages are text-only; keeping the files here would silently
+      // drop them on flush. Ask for the next message instead.
+      if (pending.length) {
+        setAttachError("Wait for this turn to finish, then send the files.");
+        return;
+      }
       enqueue(prompt.trim());
       return;
     }
-    startTurn(prompt);
+    startTurn(prompt, pending);
   }
 
   function enqueue(text: string) {
@@ -1073,15 +1309,18 @@ export default function Chat({
     requestAnimationFrame(scrollDown);
   }
 
-  async function startTurn(prompt: string) {
+  async function startTurn(prompt: string, pending: PendingAttachment[] = []) {
     // No streaming check: callers own that (sendPrompt enqueues mid-turn,
     // maybeFlush only runs once the previous turn fully ended).
-    if (!thread || !prompt.trim()) return;
+    if (!thread || (!prompt.trim() && pending.length === 0)) return;
     lastPrompt.current = prompt;
     catchupRef.current = false;
     pendingFilter.current = null;
     setDraft("");
     draftRef.current = "";
+    setPendingAttachments([]);
+    setMention(null);
+    setAttachError(null);
     if (threadRef.current) drafts.current[threadRef.current] = "";
     setTurnError(null);
     setPerms([]);
@@ -1091,19 +1330,32 @@ export default function Chat({
     liveTextRef.current = "";
     turnStart.current = Date.now();
     turnActiveRef.current = true;
+    const optimistic: FileChip[] = pending.map((a) => ({ name: a.name, mime: a.mime, url: a.dataUrl }));
     setMsgs((prev) => [
       ...prev,
-      { id: nid(), role: "user", segs: [{ kind: "text", text: prompt }] },
+      {
+        id: nid(),
+        role: "user",
+        segs: prompt.trim() ? [{ kind: "text", text: prompt }] : [],
+        ...(optimistic.length ? { attachments: optimistic } : {}),
+      },
     ]);
     setStreaming(true);
     setActivity("Thinking…");
     stick.current = true;
     requestAnimationFrame(scrollDown);
     try {
+      const chatAttachments: ChatAttachment[] = pending.map((a) => ({
+        kind: "image",
+        name: a.name,
+        mime: a.mime,
+        dataUrl: a.dataUrl,
+      }));
       const { sessionId } = await postChat(
         thread.id,
         prompt,
         permissionModesRef.current[thread.id] ?? safePermissionMode(botPermissionMode, agent),
+        chatAttachments.length ? chatAttachments : undefined,
       );
       if (threadRef.current !== thread.id) return;
       sessionRef.current = sessionId;
@@ -1427,6 +1679,7 @@ export default function Chat({
               key={m.id}
               className={`${m.role === "user" ? "bubble user" : "bubble assistant"}${m.id.startsWith("m") ? " msg-in" : ""}`}
             >
+              {m.attachments?.length ? <MessageAttachments files={m.attachments} /> : null}
               {m.segs.map((s, si) =>
                 s.kind === "text" ? (
                   <RichText key={si} botColor={botAvatar?.color} text={setup && m.role === "assistant" ? presentSetupText(s.text) : s.text} />
@@ -1636,7 +1889,68 @@ export default function Chat({
             onEdit={editQueue}
             onDiscard={discardQueue}
           />
-          <div className="composer-pill">
+          <div
+            className={`composer-pill${dragOver ? " is-dragover" : ""}`}
+            onDragOver={(e) => {
+              if (!clipAllowed) return;
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
+            }}
+            onDrop={(e) => {
+              if (!clipAllowed) return;
+              e.preventDefault();
+              setDragOver(false);
+              void addFiles(e.dataTransfer.files);
+            }}
+          >
+            {attachments.length > 0 && (
+              <div className="composer-attachments" aria-label="Attachments">
+                {attachments.map((a) => (
+                  <span key={a.id} className={`composer-attachment ${a.kind}`}>
+                    {a.kind === "image" ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={a.dataUrl} alt="" />
+                    ) : (
+                      <AnimatedActionIcon icon={FileTextIcon} size={14} aria-hidden="true" />
+                    )}
+                    <span className="composer-attachment-copy">
+                      <strong>{a.name}</strong>
+                      <small>{formatBytes(a.size)}</small>
+                    </span>
+                    <button
+                      type="button"
+                      className="composer-attachment-remove"
+                      onClick={() => removeAttachment(a.id)}
+                      aria-label={`Remove ${a.name}`}
+                    >
+                      <AnimatedActionIcon icon={XIcon} size={12} aria-hidden="true" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+            {mention && mention.items.length > 0 && (
+              <div className="composer-mention" role="listbox" aria-label="Files in this repository">
+                {mention.items.map((item, i) => (
+                  <button
+                    key={item.path}
+                    type="button"
+                    role="option"
+                    aria-selected={i === mention.index}
+                    className={i === mention.index ? "is-active" : undefined}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pickMention(item)}
+                  >
+                    <AnimatedActionIcon icon={FileTextIcon} size={14} aria-hidden="true" />
+                    <span>{item.name}</span>
+                    <small>{item.path}</small>
+                  </button>
+                ))}
+              </div>
+            )}
             <textarea
               ref={boxRef}
               value={draft}
@@ -1644,10 +1958,43 @@ export default function Chat({
               onChange={(e) => {
                 setDraft(e.target.value);
                 draftRef.current = e.target.value;
+                if (threadRef.current) drafts.current[threadRef.current] = e.target.value;
                 e.target.style.height = "auto";
                 e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
+                refreshMention();
+              }}
+              onClick={refreshMention}
+              onBlur={() => window.setTimeout(() => setMention(null), 120)}
+              onPaste={(e) => {
+                const files = Array.from(e.clipboardData.files ?? []);
+                if (files.length) {
+                  e.preventDefault();
+                  void addFiles(files);
+                }
               }}
               onKeyDown={(e) => {
+                if (mention && mention.items.length > 0) {
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setMention((m) => m ? { ...m, index: (m.index + 1) % m.items.length } : m);
+                    return;
+                  }
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setMention((m) => m ? { ...m, index: (m.index - 1 + m.items.length) % m.items.length } : m);
+                    return;
+                  }
+                  if (e.key === "Enter" || e.key === "Tab") {
+                    e.preventDefault();
+                    pickMention(mention.items[mention.index]);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setMention(null);
+                    return;
+                  }
+                }
                 if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
                   e.preventDefault();
                   sendPrompt(draft);
@@ -1665,9 +2012,11 @@ export default function Chat({
                   ? streaming
                     ? "Add setup information…"
                     : "Reply if setup needs you…"
-                  : streaming
-                    ? "Add a follow-up…"
-                    : `Ask ${botName}…`
+                  : attachments.length
+                    ? "Add a note about these files…"
+                    : streaming
+                      ? "Add a follow-up…"
+                      : `Ask ${botName}…`
               }
               aria-label={setup ? "Setup response" : "Message"}
             />
@@ -1722,28 +2071,70 @@ export default function Chat({
                 <button type="button" className="menu-scrim" onClick={() => setActiveMenu(null)} aria-label="Close permissions" tabIndex={-1} />
               </>}
             </div>
-            {streaming ? (
-              <div className="composer-action">
-                {escapeStopArmed && (
-                  <span className="stop-confirm" role="status">Press <kbd>Esc</kbd> again to stop</span>
-                )}
+            <div className="composer-actions">
+              {clipAllowed && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={
+                      capabilities?.known && capabilities.image === false
+                        ? "application/pdf"
+                        : capabilities?.known && capabilities.pdf === false
+                          ? "image/*"
+                          : "image/*,application/pdf"
+                    }
+                    multiple
+                    hidden
+                    onChange={(e) => {
+                      void addFiles(e.target.files);
+                      e.target.value = "";
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="composer-attach-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={streaming || turnActiveRef.current}
+                    aria-label="Attach an image or PDF"
+                    data-tip={streaming ? "Wait for this turn to finish" : "Attach an image or PDF"}
+                    data-tip-pos="above"
+                  >
+                    <AnimatedActionIcon icon={PaperclipIcon} size={16} aria-hidden="true" />
+                  </button>
+                </>
+              )}
+              {streaming ? (
+                <div className="composer-action">
+                  {escapeStopArmed && (
+                    <span className="stop-confirm" role="status">Press <kbd>Esc</kbd> again to stop</span>
+                  )}
+                  <button
+                    type="button"
+                    className="send-btn"
+                    onClick={stop}
+                    aria-label="Stop"
+                    data-tip={escapeStopArmed ? undefined : "Stop"}
+                    data-tip-pos="above"
+                  >
+                    <span className="stop-glyph" aria-hidden="true" />
+                  </button>
+                </div>
+              ) : (
                 <button
-                  type="button"
+                  type="submit"
                   className="send-btn"
-                  onClick={stop}
-                  aria-label="Stop"
-                  data-tip={escapeStopArmed ? undefined : "Stop"}
+                  disabled={!draft.trim() && attachments.length === 0}
+                  aria-label="Send"
+                  data-tip="Send"
                   data-tip-pos="above"
                 >
-                  <span className="stop-glyph" aria-hidden="true" />
+                  <AnimatedActionIcon icon={ArrowUpIcon} size={16} aria-hidden="true" />
                 </button>
-              </div>
-            ) : (
-              <button type="submit" className="send-btn" disabled={!draft.trim()} aria-label="Send" data-tip="Send" data-tip-pos="above">
-                <AnimatedActionIcon icon={ArrowUpIcon} size={16} aria-hidden="true" />
-              </button>
-            )}
+              )}
+            </div>
           </div>
+          {attachError && <p className="composer-attach-error" role="status">{attachError}</p>}
           </form>
         </>
       )}
