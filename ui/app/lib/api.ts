@@ -113,6 +113,22 @@ export function postChat(
   });
 }
 
+export type DirEntry = {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  size: number | null;
+};
+
+/** Entries of one folder inside a repo, for the composer's path picker.
+ *  Mirrors GET /dir; `path` defaults to the repo root. */
+export function listDir(repoPath: string, path?: string) {
+  const query = `repoPath=${encodeURIComponent(repoPath)}${
+    path ? `&path=${encodeURIComponent(path)}` : ""
+  }`;
+  return req<{ entries: DirEntry[] }>(`/dir?${query}`);
+}
+
 /** Fuzzy file search inside a repo for the composer's `@` picker. */
 export function searchFiles(repoPath: string, q: string) {
   return req<{ files: { path: string; name: string }[] }>(

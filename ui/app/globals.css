@@ -1580,6 +1580,109 @@ pre {
   font-size: var(--text-xs);
 }
 
+/* Path picker: browse the repo and insert `@relative/path` without typing it. */
+.composer-attach-btn.is-active { background: var(--surface-2); color: var(--text); }
+
+.composer-path {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% + 8px);
+  z-index: 60;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  max-height: 380px;
+  padding: 6px;
+  background: var(--surface-active);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.24);
+}
+.composer-path-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 6px;
+  color: var(--muted);
+}
+.composer-path-crumbs {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.composer-path-close {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.composer-path-close:hover { background: var(--surface-2); color: var(--text); }
+.composer-path-search {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+.composer-path-search:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.composer-path-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+  overflow: auto;
+}
+.composer-path-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, auto) 1fr;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.composer-path-row:hover { background: var(--surface-2); }
+.composer-path-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.composer-path-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-align: right;
+}
+.composer-path-row.folder-ref { border: 1px dashed var(--border); }
+.composer-path-empty {
+  margin: 8px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
 .msg-attachments {
   display: flex;
   flex-wrap: wrap;

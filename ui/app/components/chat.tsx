@@ -17,6 +17,7 @@ import { ZapIcon } from "@animateicons/react/lucide/zap-icon";
 import { FileTextIcon } from "@animateicons/react/lucide/file-text-icon";
 import { ChevronDownIcon } from "@animateicons/react/lucide/chevron-down-icon";
 import { PaperclipIcon } from "@animateicons/react/lucide/paperclip-icon";
+import { FolderIcon } from "@animateicons/react/lucide/folder-icon";
 import { XIcon } from "@animateicons/react/lucide/x-icon";
 
 import { Children, Fragment, isValidElement, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
@@ -38,10 +39,12 @@ import {
   postAbort,
   postChat,
   postPermission,
+  listDir,
   searchFiles,
   streamUrl,
   type ChatAttachment,
   type ChatPermissionMode,
+  type DirEntry,
   type ModelCapabilities,
 } from "../lib/api";
 import {
@@ -76,6 +79,46 @@ type Seg =
   | { kind: "tools"; tools: ToolChip[] };
 /** A file part that rode with a message: an image preview or a PDF chip. */
 type FileChip = { name: string; mime: string; url: string };
+
+/** Forward slashes, no trailing separator: the shape `@mentions` use. */
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/** Repo-relative path for an absolute one; "" when it is the repo root. */
+function repoRelativePath(abs: string, repoRoot: string): string {
+  const a = normalizePath(abs);
+  const r = normalizePath(repoRoot);
+  if (a.toLowerCase() === r.toLowerCase()) return "";
+  if (a.toLowerCase().startsWith(`${r.toLowerCase()}/`)) return a.slice(r.length + 1);
+  return a;
+}
+
+/** Parent folder of `abs`, clamped to the repo root. */
+function parentDirPath(abs: string, repoRoot: string): string {
+  const a = normalizePath(abs);
+  const r = normalizePath(repoRoot);
+  if (a.toLowerCase() === r.toLowerCase()) return r;
+  const idx = a.lastIndexOf("/");
+  const parent = idx > 0 ? a.slice(0, idx) : a;
+  return parent.length >= r.length ? parent : r;
+}
+
+/** Insert `token` at `caret`, keeping a separating space and moving the caret. */
+function insertAtCaret(
+  text: string,
+  caret: number,
+  token: string,
+): { text: string; caret: number } {
+  const before = text.slice(0, caret);
+  const after = text.slice(caret);
+  const needsSpace = before.length > 0 && !/\s$/.test(before) ? " " : "";
+  const inserted = `${needsSpace}${token} `;
+  return {
+    text: `${before}${inserted}${after.replace(/^\s+/, "")}`,
+    caret: before.length + inserted.length,
+  };
+}
 /** One subagent of the current turn, rebuilt from `subagent` + child events. */
 type LiveSubagent = {
   parentToolUseId: string;
@@ -666,6 +709,15 @@ export default function Chat({
   const [attachError, setAttachError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Path picker: attach a file or folder as an `@mention` instead of typing
+  // its path. Text-only, so it stays usable while a turn is running.
+  const [pathOpen, setPathOpen] = useState(false);
+  const [pathDir, setPathDir] = useState<{ path: string; entries: DirEntry[] } | null>(null);
+  const [pathBusy, setPathBusy] = useState(false);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const [pathQuery, setPathQuery] = useState("");
+  const [pathResults, setPathResults] = useState<{ path: string; name: string }[] | null>(null);
+  const pathTimer = useRef<number | null>(null);
   const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
   const [variant, setVariant] = useState<string | null>(null);
   const variantRef = useRef<string | null>(null);
@@ -1545,6 +1597,71 @@ export default function Chat({
     });
   }
 
+  // ---- Path picker: attach a file or folder as an @mention -------------
+
+  async function loadPathDir(target?: string) {
+    if (!thread) return;
+    setPathBusy(true);
+    setPathError(null);
+    try {
+      const dir = target ?? thread.repoPath;
+      const { entries } = await listDir(thread.repoPath, dir);
+      setPathDir({ path: dir, entries });
+    } catch (err: any) {
+      setPathDir(null);
+      setPathError(err?.message ?? "Could not list this folder.");
+    } finally {
+      setPathBusy(false);
+    }
+  }
+
+  function openPathPicker() {
+    if (!thread) return;
+    setPathOpen(true);
+    setPathQuery("");
+    setPathResults(null);
+    setMention(null);
+    void loadPathDir(thread.repoPath);
+  }
+
+  function closePathPicker() {
+    setPathOpen(false);
+    setPathQuery("");
+    setPathResults(null);
+    setPathError(null);
+  }
+
+  /** Put `@repo/relative/path` in the composer, at the caret or over the
+   *  `@token` being typed. Nothing is uploaded: the agent reads the path. */
+  function insertPathReference(absPath: string, isDir: boolean) {
+    if (!thread) return;
+    const rel = repoRelativePath(absPath, thread.repoPath);
+    if (!rel) {
+      setPathError("Pick something inside this repository.");
+      return;
+    }
+    const box = boxRef.current;
+    const current = box?.value ?? draftRef.current;
+    const caret = box?.selectionStart ?? current.length;
+    const active = mentionQueryAt(current, caret);
+    const next = active
+      ? applyMention(current, active.start, active.end, `${rel}${isDir ? "/" : ""}`)
+      : insertAtCaret(current, caret, `@${rel}${isDir ? "/" : ""}`);
+
+    setDraft(next.text);
+    draftRef.current = next.text;
+    if (threadRef.current) drafts.current[threadRef.current] = next.text;
+    closePathPicker();
+    requestAnimationFrame(() => {
+      const el = boxRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(next.caret, next.caret);
+        fitBox();
+      }
+    });
+  }
+
   // Search files for the open `@token` (debounced).
   useEffect(() => {
     if (!mention || !thread) return;
@@ -1568,6 +1685,27 @@ export default function Chat({
       mentionTimer.current = null;
     };
   }, [mention?.query, thread?.id]);
+
+  // Path picker search (debounced): fuzzy file names inside the repo.
+  useEffect(() => {
+    if (!pathOpen || !thread) return;
+    const q = pathQuery.trim();
+    if (q.length < 2) {
+      setPathResults(null);
+      return;
+    }
+    if (pathTimer.current) window.clearTimeout(pathTimer.current);
+    pathTimer.current = window.setTimeout(() => {
+      pathTimer.current = null;
+      searchFiles(thread.repoPath, q)
+        .then(({ files }) => setPathResults(files))
+        .catch(() => setPathResults([]));
+    }, 140);
+    return () => {
+      if (pathTimer.current) window.clearTimeout(pathTimer.current);
+      pathTimer.current = null;
+    };
+  }, [pathQuery, pathOpen, thread?.id]);
 
   // The clip is only honest for OpenCode + a model that declares vision/PDF.
   useEffect(() => {
@@ -2288,6 +2426,126 @@ export default function Chat({
                 ))}
               </div>
             )}
+            {pathOpen && (
+              <>
+                <button
+                  type="button"
+                  className="menu-scrim"
+                  aria-label="Close path picker"
+                  tabIndex={-1}
+                  onClick={closePathPicker}
+                />
+                <div className="composer-path" role="dialog" aria-label="Attach a file or folder">
+                  <header className="composer-path-head">
+                    <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
+                    <span className="composer-path-crumbs" title={pathDir?.path}>
+                      {pathDir
+                        ? repoRelativePath(pathDir.path, thread?.repoPath ?? "") ||
+                          (thread?.repoPath ?? "").split(/[\\/]/).filter(Boolean).pop() ||
+                          "Repository"
+                        : "Loading…"}
+                    </span>
+                    <button
+                      type="button"
+                      className="composer-path-close"
+                      onClick={closePathPicker}
+                      aria-label="Close"
+                    >
+                      <AnimatedActionIcon icon={XIcon} size={12} aria-hidden="true" />
+                    </button>
+                  </header>
+                  <input
+                    className="composer-path-search"
+                    value={pathQuery}
+                    onChange={(e) => setPathQuery(e.target.value)}
+                    placeholder="Search files by name…"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        closePathPicker();
+                      }
+                    }}
+                  />
+                  <div className="composer-path-list">
+                    {pathError && <p className="composer-path-empty">{pathError}</p>}
+                    {pathBusy && <p className="composer-path-empty">Reading…</p>}
+                    {!pathBusy && pathQuery.trim().length >= 2
+                      ? pathResults === null
+                        ? null
+                        : pathResults.length === 0
+                          ? <p className="composer-path-empty">No files match.</p>
+                          : pathResults.map((f) => (
+                              <button
+                                key={f.path}
+                                type="button"
+                                className="composer-path-row"
+                                onClick={() => insertPathReference(f.path, false)}
+                              >
+                                <AnimatedActionIcon icon={FileTextIcon} size={14} aria-hidden="true" />
+                                <span>{f.name}</span>
+                                <small>{repoRelativePath(f.path, thread?.repoPath ?? "")}</small>
+                              </button>
+                            ))
+                      : !pathBusy && pathDir
+                        ? (
+                          <>
+                            {repoRelativePath(pathDir.path, thread?.repoPath ?? "") ? (
+                              <button
+                                type="button"
+                                className="composer-path-row"
+                                onClick={() =>
+                                  void loadPathDir(parentDirPath(pathDir.path, thread?.repoPath ?? ""))
+                                }
+                              >
+                                <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
+                                <span>..</span>
+                                <small>Up one folder</small>
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="composer-path-row folder-ref"
+                              onClick={() => insertPathReference(pathDir.path, true)}
+                            >
+                              <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
+                              <span>Attach this folder</span>
+                              <small>
+                                @{repoRelativePath(pathDir.path, thread?.repoPath ?? "") || "."}
+                              </small>
+                            </button>
+                            {pathDir.entries.map((entry) =>
+                              entry.type === "directory" ? (
+                                <button
+                                  key={entry.path}
+                                  type="button"
+                                  className="composer-path-row"
+                                  onClick={() => void loadPathDir(entry.path)}
+                                >
+                                  <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
+                                  <span>{entry.name}</span>
+                                  <small>folder</small>
+                                </button>
+                              ) : (
+                                <button
+                                  key={entry.path}
+                                  type="button"
+                                  className="composer-path-row"
+                                  onClick={() => insertPathReference(entry.path, false)}
+                                >
+                                  <AnimatedActionIcon icon={FileTextIcon} size={14} aria-hidden="true" />
+                                  <span>{entry.name}</span>
+                                  <small>{formatBytes(entry.size ?? 0)}</small>
+                                </button>
+                              ),
+                            )}
+                          </>
+                        )
+                        : null}
+                  </div>
+                </div>
+              </>
+            )}
             {mention && mention.items.length > 0 && (
               <div className="composer-mention" role="listbox" aria-label="Files in this repository">
                 {mention.items.map((item, i) => (
@@ -2510,6 +2768,19 @@ export default function Chat({
             ) : null}
             </div>
             <div className="composer-actions">
+              {thread && (
+                <button
+                  type="button"
+                  className={`composer-attach-btn${pathOpen ? " is-active" : ""}`}
+                  onClick={() => (pathOpen ? closePathPicker() : openPathPicker())}
+                  aria-label="Attach a file or folder path"
+                  aria-expanded={pathOpen}
+                  data-tip="Attach a file or folder"
+                  data-tip-pos="above"
+                >
+                  <AnimatedActionIcon icon={FolderIcon} size={16} aria-hidden="true" />
+                </button>
+              )}
               {clipAllowed && (
                 <>
                   <input
