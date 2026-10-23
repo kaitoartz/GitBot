@@ -2171,7 +2171,7 @@ export default function Chat({
           </div>
         </div>
       ) : (
-        <>
+        <div className="composer-dock">
           <UsageBar
             threadId={thread?.id ?? null}
             sessionId={sessionRef.current}
@@ -2441,7 +2441,7 @@ export default function Chat({
           </div>
           {attachError && <p className="composer-attach-error" role="status">{attachError}</p>}
           </form>
-        </>
+        </div>
       )}
     </main>
   );

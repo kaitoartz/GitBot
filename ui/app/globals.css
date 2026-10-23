@@ -2867,6 +2867,25 @@ pre {
   z-index: 2;
 }
 
+/* Usage bar + composer are one dock: the negative margin moves both up
+   together, so the bar can never end up under the pill. */
+.page-body .composer-dock {
+  width: 100%;
+  max-width: 806px;
+  min-width: 0;
+  margin-inline: auto;
+  margin-top: -64px;
+  position: relative;
+  z-index: 2;
+}
+
+.page-body .composer-dock .composer {
+  max-width: none;
+  margin-top: 0;
+  position: static;
+  z-index: auto;
+}
+
 .page-body.logo-only {
   min-height: 100vh;
   min-height: 100dvh;
