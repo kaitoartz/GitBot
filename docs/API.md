@@ -25,6 +25,7 @@ The workspace is the directory `gitbot start` was run in. Repos are its subdirec
 | `POST` | `/folders` | Create an empty folder in the workspace. Body: `{ name }`. Returns `{ path, name }` |
 | `GET` | `/browse?path=<dir>` | Folder picker. Returns `{ path, parent, workspace, home, dirs: { name, path }[] }`. `parent` is `null` at the filesystem root. Without `path` it starts at the workspace. Not confined to the workspace: it lists folders anywhere the gitbot process can read |
 | `GET` | `/dir?repoPath=<path>&path=<subpath>` | Directory entries inside a repo. The path is validated to stay inside `repoPath` |
+| `GET` | `/browse/files?path=<dir>` | Files and folders anywhere the gitbot process can read, for attaching paths outside the repo. Returns `{ path, parent, entries }` with the same entry shape as `/dir`, capped at 500 entries. Without `path` it starts at the workspace |
 | `GET` | `/files/search?repoPath=<path>&q=<query>` | Fuzzy file search inside a repo (OpenCode's `/find/file`), for the composer's `@` picker. Returns `{ files: { path, name }[] }`, `path` repo-relative, at most 20. Queries shorter than 2 chars and server errors answer `{ files: [] }` |
 | `GET` | `/models/capabilities?model=<provider/model>` | What the model accepts: `{ model, known, image, pdf, reasoning, variants, limit }`. `known: false` means the provider list has not loaded yet |
 | `GET` | `/file?repoPath=<path>&path=<filePath>` | Read a file. Validated to stay inside `repoPath`. 5 MB max |

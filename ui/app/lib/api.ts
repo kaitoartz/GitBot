@@ -129,6 +129,14 @@ export function listDir(repoPath: string, path?: string) {
   return req<{ entries: DirEntry[] }>(`/dir?${query}`);
 }
 
+/** Entries of any folder the gitbot process can read, including paths outside
+ *  the repo. Mirrors GET /browse/files; `path` defaults to the workspace. */
+export function browseEntries(path?: string) {
+  return req<{ path: string; parent: string | null; entries: DirEntry[] }>(
+    path ? `/browse/files?path=${encodeURIComponent(path)}` : "/browse/files",
+  );
+}
+
 /** Fuzzy file search inside a repo for the composer's `@` picker. */
 export function searchFiles(repoPath: string, q: string) {
   return req<{ files: { path: string; name: string }[] }>(

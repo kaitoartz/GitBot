@@ -1615,6 +1615,19 @@ pre {
   font-size: var(--text-sm);
   font-weight: 600;
 }
+.composer-path-scope {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.composer-path-scope:hover { background: var(--surface-2); color: var(--text); }
 .composer-path-close {
   display: grid;
   place-items: center;

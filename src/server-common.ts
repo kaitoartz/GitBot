@@ -5,7 +5,7 @@ import http from "node:http";
 import { EventEmitter } from "events";
 import qrcode from "qrcode-terminal";
 import { serveUiFile, uiAvailable, uiFileFor } from "./static-ui";
-import { listRepos, cloneRepo, createFolder, listDir, readFile, getRepoDetails, browseDirs } from "./workspace";
+import { listRepos, cloneRepo, createFolder, listDir, listAnyDir, readFile, getRepoDetails, browseDirs } from "./workspace";
 
 // --- Transport abstractions ---
 // These interfaces cover the exact surface area that route handlers use.
@@ -615,6 +615,16 @@ export async function handleWorkspaceRoutes(
     try {
       const entries = await listDir(targetPath, repoPath);
       jsonOk(res, { entries });
+    } catch (err: any) {
+      jsonError(res, 400, err?.message ?? "Failed to list directory");
+    }
+    return true;
+  }
+
+  if (method === "GET" && path === "/browse/files") {
+    const targetPath = query.path ?? workspaceCwd;
+    try {
+      jsonOk(res, await listAnyDir(targetPath));
     } catch (err: any) {
       jsonError(res, 400, err?.message ?? "Failed to list directory");
     }

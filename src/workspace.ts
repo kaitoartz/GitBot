@@ -1,6 +1,6 @@
 import { existsSync } from "fs";
 import { mkdir, readdir, stat, readFile as fsReadFile } from "fs/promises";
-import { join, resolve, extname, relative, isAbsolute } from "path";
+import { join, resolve, extname, relative, isAbsolute, dirname } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 
@@ -132,6 +132,42 @@ export async function listDir(dirPath: string, repoRoot: string): Promise<DirEnt
     return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
   });
   return result;
+}
+
+export interface AnyDirResult {
+  path: string;
+  parent: string | null;
+  entries: DirEntry[];
+}
+
+/** Directory listing anywhere the process can read, for attaching paths that
+ *  live outside the thread's repo. No repo confinement: mirrors /browse,
+ *  which already roams the filesystem. Capped so a huge folder cannot flood
+ *  the picker. */
+export async function listAnyDir(dirPath: string): Promise<AnyDirResult> {
+  const resolved = resolve(dirPath);
+  const listing = await readdir(resolved, { withFileTypes: true });
+  const entries: DirEntry[] = [];
+  for (const entry of listing) {
+    const entryPath = join(resolved, entry.name);
+    if (entry.isDirectory()) {
+      entries.push({ name: entry.name, path: entryPath, type: "directory", size: null });
+    } else if (entry.isFile()) {
+      const s = await stat(entryPath).catch(() => null);
+      if (!s) continue;
+      entries.push({ name: entry.name, path: entryPath, type: "file", size: s.size });
+    }
+  }
+  entries.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  });
+  const parent = dirname(resolved);
+  return {
+    path: resolved,
+    parent: parent === resolved ? null : parent,
+    entries: entries.slice(0, 500),
+  };
 }
 
 // Read a file, validated to be inside repoRoot; enforces 5 MB max

@@ -40,6 +40,7 @@ import {
   postChat,
   postPermission,
   listDir,
+  browseEntries,
   searchFiles,
   streamUrl,
   type ChatAttachment,
@@ -92,6 +93,15 @@ function repoRelativePath(abs: string, repoRoot: string): string {
   if (a.toLowerCase() === r.toLowerCase()) return "";
   if (a.toLowerCase().startsWith(`${r.toLowerCase()}/`)) return a.slice(r.length + 1);
   return a;
+}
+
+/** True when repoRelativePath() produced a path inside the repo. */
+function isRepoRelative(rel: string): boolean {
+  if (!rel) return false;
+  if (rel.startsWith("..")) return false;
+  if (rel.startsWith("/")) return false;
+  if (/^[A-Za-z]:\//.test(rel)) return false;
+  return true;
 }
 
 /** Parent folder of `abs`, clamped to the repo root. */
@@ -713,6 +723,9 @@ export default function Chat({
   // its path. Text-only, so it stays usable while a turn is running.
   const [pathOpen, setPathOpen] = useState(false);
   const [pathDir, setPathDir] = useState<{ path: string; entries: DirEntry[] } | null>(null);
+  const [pathScope, setPathScope] = useState<"repo" | "any">("repo");
+  const [pathParent, setPathParent] = useState<string | null>(null);
+  const [pathJump, setPathJump] = useState("");
   const [pathBusy, setPathBusy] = useState(false);
   const [pathError, setPathError] = useState<string | null>(null);
   const [pathQuery, setPathQuery] = useState("");
@@ -1599,16 +1612,24 @@ export default function Chat({
 
   // ---- Path picker: attach a file or folder as an @mention -------------
 
-  async function loadPathDir(target?: string) {
+  async function loadPathDir(target?: string, scope: "repo" | "any" = pathScope) {
     if (!thread) return;
     setPathBusy(true);
     setPathError(null);
     try {
       const dir = target ?? thread.repoPath;
-      const { entries } = await listDir(thread.repoPath, dir);
-      setPathDir({ path: dir, entries });
+      if (scope === "repo") {
+        const { entries } = await listDir(thread.repoPath, dir);
+        setPathDir({ path: dir, entries });
+        setPathParent(parentDirPath(dir, thread.repoPath));
+      } else {
+        const res = await browseEntries(dir);
+        setPathDir({ path: res.path, entries: res.entries });
+        setPathParent(res.parent);
+      }
     } catch (err: any) {
       setPathDir(null);
+      setPathParent(null);
       setPathError(err?.message ?? "Could not list this folder.");
     } finally {
       setPathBusy(false);
@@ -1618,21 +1639,35 @@ export default function Chat({
   function openPathPicker() {
     if (!thread) return;
     setPathOpen(true);
+    setPathScope("repo");
     setPathQuery("");
     setPathResults(null);
+    setPathJump("");
     setMention(null);
-    void loadPathDir(thread.repoPath);
+    void loadPathDir(thread.repoPath, "repo");
   }
 
   function closePathPicker() {
     setPathOpen(false);
     setPathQuery("");
     setPathResults(null);
+    setPathJump("");
     setPathError(null);
   }
 
-  /** Put `@repo/relative/path` in the composer, at the caret or over the
-   *  `@token` being typed. Nothing is uploaded: the agent reads the path. */
+  /** Repo mode browses inside the thread's folder; "any" roams the disk. */
+  function switchPathScope(next: "repo" | "any") {
+    if (!thread || next === pathScope) return;
+    setPathScope(next);
+    setPathQuery("");
+    setPathResults(null);
+    const start = next === "any" ? (pathDir?.path ?? thread.repoPath) : thread.repoPath;
+    setPathJump(next === "any" ? start : "");
+    void loadPathDir(start, next);
+  }
+
+  /** Put `@repo/relative/path` (inside) or `` `D:/abs/path` `` (outside) in the
+   *  composer. Nothing is uploaded: the agent reads the path itself. */
   function insertPathReference(absPath: string, isDir: boolean) {
     if (!thread) return;
     const rel = repoRelativePath(absPath, thread.repoPath);
@@ -1640,13 +1675,25 @@ export default function Chat({
       setPathError("Pick something inside this repository.");
       return;
     }
+    const inside = isRepoRelative(rel);
+    const suffix = isDir ? "/" : "";
+    const token = inside ? `@${rel}${suffix}` : `\`${rel}${suffix}\``;
     const box = boxRef.current;
     const current = box?.value ?? draftRef.current;
     const caret = box?.selectionStart ?? current.length;
     const active = mentionQueryAt(current, caret);
-    const next = active
-      ? applyMention(current, active.start, active.end, `${rel}${isDir ? "/" : ""}`)
-      : insertAtCaret(current, caret, `@${rel}${isDir ? "/" : ""}`);
+    let next: { text: string; caret: number };
+    if (active) {
+      const before = current.slice(0, active.start);
+      const after = current.slice(active.end);
+      const inserted = `${token} `;
+      next = {
+        text: `${before}${inserted}${after.replace(/^\s+/, "")}`,
+        caret: before.length + inserted.length,
+      };
+    } else {
+      next = insertAtCaret(current, caret, token);
+    }
 
     setDraft(next.text);
     draftRef.current = next.text;
@@ -1688,7 +1735,7 @@ export default function Chat({
 
   // Path picker search (debounced): fuzzy file names inside the repo.
   useEffect(() => {
-    if (!pathOpen || !thread) return;
+    if (!pathOpen || !thread || pathScope !== "repo") return;
     const q = pathQuery.trim();
     if (q.length < 2) {
       setPathResults(null);
@@ -1705,7 +1752,7 @@ export default function Chat({
       if (pathTimer.current) window.clearTimeout(pathTimer.current);
       pathTimer.current = null;
     };
-  }, [pathQuery, pathOpen, thread?.id]);
+  }, [pathQuery, pathOpen, pathScope, thread?.id]);
 
   // The clip is only honest for OpenCode + a model that declares vision/PDF.
   useEffect(() => {
@@ -2439,12 +2486,27 @@ export default function Chat({
                   <header className="composer-path-head">
                     <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
                     <span className="composer-path-crumbs" title={pathDir?.path}>
-                      {pathDir
-                        ? repoRelativePath(pathDir.path, thread?.repoPath ?? "") ||
-                          (thread?.repoPath ?? "").split(/[\\/]/).filter(Boolean).pop() ||
-                          "Repository"
-                        : "Loading…"}
+                      {pathScope === "any"
+                        ? pathDir?.path ?? "Loading…"
+                        : pathDir
+                          ? repoRelativePath(pathDir.path, thread?.repoPath ?? "") ||
+                            (thread?.repoPath ?? "").split(/[\\/]/).filter(Boolean).pop() ||
+                            "Repository"
+                          : "Loading…"}
                     </span>
+                    <button
+                      type="button"
+                      className="composer-path-scope"
+                      onClick={() => switchPathScope(pathScope === "repo" ? "any" : "repo")}
+                      data-tip={
+                        pathScope === "repo"
+                          ? "Browse paths outside this repository"
+                          : "Back to the repository"
+                      }
+                      data-tip-pos="above"
+                    >
+                      {pathScope === "repo" ? "Outside repo" : "Back to repo"}
+                    </button>
                     <button
                       type="button"
                       className="composer-path-close"
@@ -2454,23 +2516,45 @@ export default function Chat({
                       <AnimatedActionIcon icon={XIcon} size={12} aria-hidden="true" />
                     </button>
                   </header>
-                  <input
-                    className="composer-path-search"
-                    value={pathQuery}
-                    onChange={(e) => setPathQuery(e.target.value)}
-                    placeholder="Search files by name…"
-                    autoFocus
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") {
-                        e.stopPropagation();
-                        closePathPicker();
-                      }
-                    }}
-                  />
+                  {pathScope === "any" ? (
+                    <input
+                      className="composer-path-search"
+                      value={pathJump}
+                      onChange={(e) => setPathJump(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          const target = pathJump.trim();
+                          if (target) void loadPathDir(target, "any");
+                        }
+                        if (e.key === "Escape") {
+                          e.stopPropagation();
+                          closePathPicker();
+                        }
+                      }}
+                      placeholder="Absolute path — Enter to open"
+                      spellCheck={false}
+                      autoFocus
+                    />
+                  ) : (
+                    <input
+                      className="composer-path-search"
+                      value={pathQuery}
+                      onChange={(e) => setPathQuery(e.target.value)}
+                      placeholder="Search files by name…"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") {
+                          e.stopPropagation();
+                          closePathPicker();
+                        }
+                      }}
+                    />
+                  )}
                   <div className="composer-path-list">
                     {pathError && <p className="composer-path-empty">{pathError}</p>}
                     {pathBusy && <p className="composer-path-empty">Reading…</p>}
-                    {!pathBusy && pathQuery.trim().length >= 2
+                    {!pathBusy && pathScope === "repo" && pathQuery.trim().length >= 2
                       ? pathResults === null
                         ? null
                         : pathResults.length === 0
@@ -2490,13 +2574,11 @@ export default function Chat({
                       : !pathBusy && pathDir
                         ? (
                           <>
-                            {repoRelativePath(pathDir.path, thread?.repoPath ?? "") ? (
+                            {pathParent ? (
                               <button
                                 type="button"
                                 className="composer-path-row"
-                                onClick={() =>
-                                  void loadPathDir(parentDirPath(pathDir.path, thread?.repoPath ?? ""))
-                                }
+                                onClick={() => void loadPathDir(pathParent, pathScope)}
                               >
                                 <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
                                 <span>..</span>
@@ -2511,7 +2593,9 @@ export default function Chat({
                               <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
                               <span>Attach this folder</span>
                               <small>
-                                @{repoRelativePath(pathDir.path, thread?.repoPath ?? "") || "."}
+                                {pathScope === "any"
+                                  ? pathDir.path
+                                  : `@${repoRelativePath(pathDir.path, thread?.repoPath ?? "") || "."}`}
                               </small>
                             </button>
                             {pathDir.entries.map((entry) =>
@@ -2520,7 +2604,7 @@ export default function Chat({
                                   key={entry.path}
                                   type="button"
                                   className="composer-path-row"
-                                  onClick={() => void loadPathDir(entry.path)}
+                                  onClick={() => void loadPathDir(entry.path, pathScope)}
                                 >
                                   <AnimatedActionIcon icon={FolderIcon} size={14} aria-hidden="true" />
                                   <span>{entry.name}</span>
