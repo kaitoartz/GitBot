@@ -24,6 +24,10 @@ program
     "-u, --public-url <url>",
     "print the start QR for a public tunnel URL (playit.gg, Cloudflare Tunnel) instead of the LAN address"
   )
+  .option(
+    "-t, --tailscale",
+    "print the start QR for this machine's Tailscale IP (private, authenticated tailnet)"
+  )
   // The server is always local now; the flag stays so existing scripts keep working.
   .option("-l, --local", "bind a local port (the default)")
   .action(async (opts) => {
@@ -32,7 +36,8 @@ program
       console.error("  --port must be a number between 1 and 65535");
       process.exit(1);
     }
-    await start(opts.publicUrl ?? "local", port, opts.caffeinate ?? false);
+    const network = opts.publicUrl ?? (opts.tailscale ? "tailscale" : "local");
+    await start(network, port, opts.caffeinate ?? false);
   });
 
 program.parse();

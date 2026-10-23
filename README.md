@@ -168,11 +168,20 @@ gitbot start -p 4000         # choose another port
 gitbot start --caffeinate    # keep a Mac awake during long jobs
 gitbot start --public-url https://example.trycloudflare.com
                              # QR for a tunnel instead of the LAN address
+gitbot start --tailscale     # QR for the private Tailscale IP
 ```
 
 ## Access outside your network
 
 GitBot only prints the QR for an address; the tunnel is a separate process you control. Two options:
+
+**Tailscale** (private, authenticated; best fit for your own phone): install it on this PC and on the phone, sign both into the same tailnet, then run:
+
+```bash
+gitbot start --tailscale
+```
+
+The QR points at the machine's `100.x.y.z` address, so it only opens for devices on your tailnet. No port forwarding and no public exposure.
 
 **playit.gg** (already installed): create a tunnel for TCP `localhost:3000`, keep the playit agent running, then start GitBot with the address it gives you:
 
