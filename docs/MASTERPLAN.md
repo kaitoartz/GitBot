@@ -203,35 +203,19 @@ Dos caminos, porque adjuntar código y adjuntar una imagen no son el mismo probl
 
 ### Fase 4 — Perfil de razonamiento por hilo
 
-**Restricción corregida (Fase 0).** El plan original decía que `promptAsync` no acepta razonamiento. **No es así en v1.19.3:** el body acepta un `variant: string` de primer nivel (verificado en `/doc`), y cada modelo anuncia sus variantes en `config.providers()`:
+**Estado:** hecha (S4 resuelto el 2026-10-23). `variant` es aceptado por `promptAsync`, queda en `message.info.variant` de la respuesta y aplica **por mensaje**: omitirlo vuelve al default del modelo. Los subagentes heredan la variante del turno padre.
 
-```json
-"variants": { "low": {"reasoningEffort":"low"}, "high": {...}, "max": {...} }
-```
+**Hecho**
 
-El SDK 1.2.15 todavía no tipa `variant` (sus `types.gen.d.ts` no lo incluyen), así que va con un cast puntual, igual que el resto de los campos que el server conoce y el SDK no.
+- Spike `scripts/spikes/opencode-variant.mjs`: tres turnos (`low`, `max`, sin variante) y un turno con `task`; el hijo reportó `variant: "max"`, igual que el padre.
+- Backend: `store.variant` vive junto a `mode`/`permissionMode`. `/chat` acepta `variant`, lo valida contra `getModelInfo()` y responde 400 nombrando las variantes válidas. `promptAsync` lo envía sólo si el modelo lo declara.
+- El evento `user_prompt` lleva `variant`; `GET /sessions/:id/config` lo expone.
+- UI: selector "Thinking" junto a permisos, sólo si `capabilities.variants` tiene opciones. Etiqueta honesta "aplica al próximo mensaje"; con turno corriendo, el menú queda abierto y ofrece "Restart this turn with …" (aborta y relanza el mismo prompt). La variante activa se ve en la cabecera del chat.
+- `scripts/smoke-variant.mjs`: 13/13 (low, max, limpieza, 400 con lista de variantes).
 
-**Estrategia:** dos palancas, en este orden.
+**Perfiles (fallback):** no se implementaron. No existe config de workspace que declare `rapido`/`normal`/`profundo`/`plan`; inventarlos habría sido una palanca vacía. Con un modelo sin variantes el selector simplemente no aparece y todo funciona como antes.
 
-1. **`variant` por mensaje (preferida).** Si el modelo expone `variants`, el selector manda `variant` en cada `promptAsync`: `low` / `high` / `max` / sin variante. Es razonamiento real por mensaje y sobrevive a reiniciar GitBot sin estado nuevo.
-2. **Perfil como fallback.** Si el modelo no expone variantes (o el agente no es OpenCode), "perfil" = agente de OpenCode con modelo/opciones fijas. `Bot.profile` + `Thread.profile` como override.
-
-**Trabajo**
-
-1. Spike S4: confirmar que `variant` cambia el comportamiento y se refleja en la respuesta; comprobar si aplica al próximo mensaje (esperado) y si los subagentes heredan la variante.
-2. Backend: `variant` viaja en `/chat` y queda en `SessionStore` (junto a `mode` y `permissionMode`); se envía sólo si el modelo lo declara. `GET /agents` devuelve, por modelo, `variants` + `capabilities.reasoning`.
-3. Modelo de datos de perfiles (fallback): `Bot.profile?: string`, `Thread.profile?: string`, migración tolerante.
-4. Perfiles iniciales versionados en la config del workspace: `rapido`, `normal`, `profundo`, `plan`.
-5. UI: selector en el composer junto a permisos, con la variante activa visible en la cabecera y en el resumen del turno. Etiqueta honesta: **"aplica al próximo mensaje"**; con turno corriendo, ofrecer "abortar y reiniciar con este perfil" (`session.abort`).
-6. Mostrar `capabilities.reasoning`/`variants` del modelo para no ofrecer una palanca que ese modelo no tiene.
-
-
-**Aceptación**
-
-- Con un modelo que declara `variants`, cambiar la variante y enviar: el siguiente turno sale con esa variante (verificable en la respuesta/log del server).
-- Con un modelo sin variantes, el selector no ofrece thinking; si hay perfiles declarados, se comporta como antes.
-- El botón no promete cambio en vivo; con turno activo aparece la opción de reinicio.
-- Sin perfiles ni variantes configurados, todo funciona como hoy.
+**Aceptación:** cumplida con el modelo real (`magpie/auto/deepseek-v4.1-flash-1017`: `low`, `high`, `max`) verificada por API y en `message.info.variant`; falta la pasada visual en navegador.
 
 ---
 
@@ -294,7 +278,7 @@ Bot    { ..., profile?: string }
 | **S2** | ¿`message.updated` trae tokens durante el turno o sólo al final? | **Sólo al final.** Primer update del assistant con `tokens` en cero; el snapshot real llega en `step-finish` (~4 s en un turno corto). `input` excluye cache; `total = input + output + cache.read + cache.write`. `limit.context` se lee de `config.providers()`. | 1 ✅ |
 | **S1** | ¿Qué forma de `FilePartInput` acepta el server para imagen / PDF / texto? | **Resuelto en vivo (v1.19.3).** `url` es obligatorio: `source` solo (sin `url`) da `400 Missing key ["url"]`. Acepta data URLs base64 para imagen, PDF y texto, y **normaliza** `file:///...` a data URL. Una ruta Windows pelada como `url` **no falla**: el turno queda colgado (`session.error` sin idle), por eso el server siempre arma el data URL él mismo. El part se guarda tal cual en `session.messages` (con `filename` y `mime`). | 2 ✅ |
 | **S3** | ¿El part `task` expone el `sessionId` del hijo en metadata? | Pendiente. Requiere un turno que dispare subagente; el spike deja el volcado crudo en `.spike-opencode/`. | 3 |
-| **S4** | ¿`variant` en el body cambia el razonamiento y aplica desde el próximo mensaje? | Pendiente. El OpenAPI confirma que `variant` es un campo válido del body, y los modelos declaran `variants` (`low`/`high`/`max`). Falta verificar efecto real y herencia a subagentes. | 4 |
+| **S4** | ¿ariant cambia el razonamiento y aplica desde el próximo mensaje? | **Sí:** viaja en promptAsync, queda en message.info.variant y aplica por mensaje; el hijo hereda la variante (max). Verificado con opencode-variant.mjs. | 4 |
 
 Regla: si un spike contradice el plan, se ajusta el plan **antes** de escribir código, no durante. Ya pasó dos veces (v2 vs v1; `variant` sí existe) y el plan quedó corregido.
 
@@ -334,7 +318,7 @@ Vuelca cada evento crudo a `.spike-opencode/events-<timestamp>.jsonl` (ignorado 
 | 1 Uso/contexto | 1–1.5 sesiones | **alto** | 0, S2 — **hecha** |
 | 2 Archivos | 1.5 sesiones | **alto** | 0, S1 — **hecha** |
 | 3 Subagentes | 1.5–2 sesiones | alto | 1 (para costo por hijo), S3 |
-| 4 Perfiles | 1 sesión | medio | 0, S4 |
+| 4 Razonamiento | 1 sesión | medio | 0, S4 — **hecha** |
 | 5 Orquestador | 3+ sesiones | opcional | 1–4 |
 
 **Criterio de corte:** al terminar la Fase 3 el panel debe ser la forma normal de trabajar con OpenCode; si no lo es, la Fase 5 no se empieza.

@@ -96,6 +96,7 @@ export function postChat(
   prompt: string,
   permissionMode: ChatPermissionMode,
   attachments?: ChatAttachment[],
+  variant?: string | null,
 ) {
   return req<{ sessionId: string }>("/chat", {
     method: "POST",
@@ -105,6 +106,9 @@ export function postChat(
       permissionMode: permissionMode === "plan" ? "yolo" : permissionMode,
       mode: permissionMode === "plan" ? "plan" : "build",
       ...(attachments?.length ? { attachments } : {}),
+      // Per-message reasoning level; null means "model default" and also
+      // clears a level chosen for the previous message.
+      variant: variant ?? null,
     }),
   });
 }

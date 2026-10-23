@@ -667,6 +667,12 @@ export default function Chat({
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
+  const [variant, setVariant] = useState<string | null>(null);
+  const variantRef = useRef<string | null>(null);
+  // "Restart this turn with <variant>": set from the reasoning menu while a
+  // turn is running; the next finish() relaunches the same prompt.
+  const restartTurnRef = useRef<{ prompt: string; attachments: PendingAttachment[] } | null>(null);
+  const lastTurnAttachments = useRef<PendingAttachment[]>([]);
   const [mention, setMention] = useState<{
     start: number;
     end: number;
@@ -676,12 +682,14 @@ export default function Chat({
   } | null>(null);
   const mentionTimer = useRef<number | null>(null);
   const [escapeStopArmed, setEscapeStopArmed] = useState(false);
-  const [activeMenu, setActiveMenu] = useState<"share" | "more" | "permissions" | null>(null);
+  const [activeMenu, setActiveMenu] = useState<"share" | "more" | "permissions" | "reasoning" | null>(null);
   const setShareOpen = useCallback((open: boolean) => setActiveMenu(open ? "share" : null), []);
   const moreButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const permissionButtonRef = useRef<HTMLButtonElement | null>(null);
   const permissionMenuRef = useRef<HTMLDivElement | null>(null);
+  const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
+  const reasoningMenuRef = useRef<HTMLDivElement | null>(null);
   const permissionModesRef = useRef<Record<string, ChatPermissionMode>>({});
   const [permissionModes, setPermissionModes] = useState<Record<string, ChatPermissionMode>>({});
 
@@ -815,6 +823,24 @@ export default function Chat({
       event.preventDefault();
       setActiveMenu(null);
       permissionButtonRef.current?.focus();
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [activeMenu]);
+
+  useEffect(() => {
+    if (activeMenu !== "reasoning") return;
+    const frame = window.requestAnimationFrame(() => {
+      reasoningMenuRef.current?.querySelector<HTMLButtonElement>('button[aria-checked="true"]')?.focus();
+    });
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setActiveMenu(null);
+      reasoningButtonRef.current?.focus();
     }
     document.addEventListener("keydown", closeOnEscape);
     return () => {
@@ -1208,6 +1234,10 @@ export default function Chat({
   }
 
   function finish(refetch: boolean, stopped = false) {
+    // A restart asked for from the reasoning menu survives the stop: the
+    // turn is relaunched with the same prompt once this one is fully closed.
+    const restart = stopped ? restartTurnRef.current : null;
+    if (restart) restartTurnRef.current = null;
     closeStream();
     if (stopTimer.current) {
       window.clearTimeout(stopTimer.current);
@@ -1276,6 +1306,12 @@ export default function Chat({
       requestAnimationFrame(scrollDown);
       maybeFlush(tid);
       onTurnDone();
+    }
+    if (restart) {
+      window.setTimeout(() => {
+        if (restartTurnRef.current) return;
+        void startTurn(restart.prompt, restart.attachments);
+      }, 500);
     }
   }
 
@@ -1548,6 +1584,13 @@ export default function Chat({
     };
   }, [agent, botModel]);
 
+  // Reasoning is per message: keep the ref in sync for the very next
+  // startTurn, even before React re-renders.
+  function chooseVariant(next: string | null) {
+    variantRef.current = next;
+    setVariant(next);
+  }
+
   // The composer never locks: sending mid-turn parks the message in the
   // queue (flushed by finish()), sending while idle starts a turn.
   async function sendPrompt(prompt: string) {
@@ -1582,6 +1625,7 @@ export default function Chat({
     // maybeFlush only runs once the previous turn fully ended).
     if (!thread || (!prompt.trim() && pending.length === 0)) return;
     lastPrompt.current = prompt;
+    lastTurnAttachments.current = pending;
     catchupRef.current = false;
     pendingFilter.current = null;
     setDraft("");
@@ -1626,6 +1670,7 @@ export default function Chat({
         prompt,
         permissionModesRef.current[thread.id] ?? safePermissionMode(botPermissionMode, agent),
         chatAttachments.length ? chatAttachments : undefined,
+        variantRef.current,
       );
       if (threadRef.current !== thread.id) return;
       sessionRef.current = sessionId;
@@ -1802,6 +1847,12 @@ export default function Chat({
 
   const toolbar = (onShare || onOpenBot || onNewThread) && (
     <div className="chat-toolbar" aria-label="Chat actions">
+      {variant ? (
+        <span className="chat-variant-badge" title="Reasoning level for the next message">
+          <AnimatedActionIcon icon={ZapIcon} size={12} aria-hidden="true" />
+          Thinking {variant}
+        </span>
+      ) : null}
       {onShare && <ShareDropdown open={activeMenu === "share"} onOpenChange={setShareOpen} onShare={onShare} />}
       {(onOpenBot || onNewThread) && (
         <div className="chat-toolbar-action">
@@ -2325,6 +2376,7 @@ export default function Chat({
               }
               aria-label={setup ? "Setup response" : "Message"}
             />
+            <div className="composer-controls">
             <div className="composer-permissions">
               <button
                 ref={permissionButtonRef}
@@ -2375,6 +2427,87 @@ export default function Chat({
                 </div>
                 <button type="button" className="menu-scrim" onClick={() => setActiveMenu(null)} aria-label="Close permissions" tabIndex={-1} />
               </>}
+            </div>
+            {capabilities?.variants?.length ? (
+              <div className="composer-reasoning">
+                <button
+                  ref={reasoningButtonRef}
+                  type="button"
+                  className={`composer-permission-trigger${activeMenu === "reasoning" ? " is-active" : ""}`}
+                  onClick={() => setActiveMenu((menu) => menu === "reasoning" ? null : "reasoning")}
+                  aria-label={`Reasoning: ${variant ?? "default"}`}
+                  aria-expanded={activeMenu === "reasoning"}
+                  aria-haspopup="menu"
+                  aria-controls="chat-reasoning-menu"
+                >
+                  <AnimatedActionIcon icon={ZapIcon} size={16} />
+                  <span>{variant ? `Thinking ${variant}` : "Thinking auto"}</span>
+                  <AnimatedActionIcon icon={ChevronDownIcon} size={13} />
+                </button>
+                {activeMenu === "reasoning" && <>
+                  <div
+                    ref={reasoningMenuRef}
+                    id="chat-reasoning-menu"
+                    className="composer-permission-menu composer-reasoning-menu"
+                    role="menu"
+                    aria-label="Reasoning"
+                    onKeyDown={moveMenuFocus}
+                  >
+                    <div className="composer-permission-menu-title">
+                      <span>Reasoning</span>
+                      <span className="composer-reasoning-model">{botModel?.split("/").pop()}</span>
+                    </div>
+                    {[null, ...capabilities.variants].map((level) => (
+                      <button
+                        key={level ?? "default"}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={variant === level}
+                        onClick={() => {
+                          chooseVariant(level);
+                          // While a turn runs, keep the menu open so the
+                          // restart action stays one click away.
+                          if (!streaming) setActiveMenu(null);
+                        }}
+                      >
+                        <AnimatedActionIcon icon={ZapIcon} size={17} />
+                        <span className="composer-permission-option-copy">
+                          <strong>{level ? level[0].toUpperCase() + level.slice(1) : "Model default"}</strong>
+                          <small>
+                            {level
+                              ? `Sends variant "${level}" with the next message.`
+                              : "No variant: whatever the model does by default."}
+                          </small>
+                        </span>
+                        {variant === level && <AnimatedActionIcon icon={CheckIcon} size={15} />}
+                      </button>
+                    ))}
+                    <p>
+                      {streaming
+                        ? "Applies to the next message. To change this turn, restart it below."
+                        : "Applies to the next message in this conversation."}
+                    </p>
+                    {streaming && lastPrompt.current && (
+                      <button
+                        type="button"
+                        className="composer-reasoning-restart"
+                        onClick={() => {
+                          restartTurnRef.current = {
+                            prompt: lastPrompt.current,
+                            attachments: lastTurnAttachments.current,
+                          };
+                          setActiveMenu(null);
+                          stop();
+                        }}
+                      >
+                        Restart this turn with {variant ?? "the default"}
+                      </button>
+                    )}
+                  </div>
+                  <button type="button" className="menu-scrim" onClick={() => setActiveMenu(null)} aria-label="Close reasoning" tabIndex={-1} />
+                </>}
+              </div>
+            ) : null}
             </div>
             <div className="composer-actions">
               {clipAllowed && (

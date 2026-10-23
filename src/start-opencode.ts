@@ -322,6 +322,15 @@ export async function runAgent(store: SessionStore): Promise<void> {
     }
     const fileParts = await Promise.all(binary.map(filePartFor));
 
+    // Reasoning variant: a per-message lever OpenCode 1.x accepts in the
+    // prompt body (the SDK types lag behind). Only send it when the model
+    // actually declares that variant; anything else is the model default.
+    let variant: string | undefined;
+    if (store.variant && modelParam) {
+      const info = getModelInfo(modelParam.providerID, modelParam.modelID);
+      if (info?.variants.includes(store.variant)) variant = store.variant;
+    }
+
     // Use promptAsync so the request returns immediately; completion signaled via event stream
     const promptResult = await client.session.promptAsync({
       path: { id: store.sdkSessionId! },
@@ -332,6 +341,7 @@ export async function runAgent(store: SessionStore): Promise<void> {
           ...legacyAttachments.map(att => ({ type: "file" as const, mime: "image/jpeg", url: att.url })),
         ],
         ...(modelParam ? { model: modelParam } : {}),
+        ...(variant ? { variant } : {}),
         ...(store.mode ? { agent: store.mode } : {}),
         // A bot is a preset: its instructions ride along as the system prompt.
         // OpenCode takes it per message, so it is sent on every turn.

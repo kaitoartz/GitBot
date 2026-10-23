@@ -91,6 +91,8 @@ Two body forms:
 
 Both accept `attachments`. Session `permissionMode` values are `ask-permissions`, `allow-all-edits` and `yolo`.
 
+**Reasoning variant (OpenCode):** both forms accept `variant: string | null` — one of the model's declared `variants` (`low`, `high`, `max`, …) from `/models/capabilities`. It applies to that message only; omitting it or sending `null` uses the model default (it does not inherit the previous message's level). An unknown value is rejected with `400` and the list of valid variants. The variant is sent to OpenCode only when the model declares it. Subagents spawned by a `task` inherit the parent's variant.
+
 **Attachments** describe files that ride with the message. Two shapes:
 
 ```json
@@ -140,7 +142,7 @@ A session is one running (or finished) agent conversation, held in the server's 
 | `GET` | `/sessions?agent=<agent>&repoPath=<path>` | `{ sessions }` — past sessions for a folder, read from the agent's own store |
 | `GET` | `/sessions/:id/history?agent=<agent>&repoPath=<path>` | `{ messages }` for a session |
 | `GET` | `/sessions/:id/status` | `{ streaming: boolean, sdkSessionId }` |
-| `GET` | `/sessions/:id/config` | `{ gitbotId, sessionId, agent, model, mode, permissionMode }` |
+| `GET` | `/sessions/:id/config` | `{ gitbotId, sessionId, agent, model, variant, mode, permissionMode }` |
 | `PATCH` | `/sessions/:id` | Change the permission mode, also mid-turn. Body: `{ permissionMode }`. Approvals already waiting that the new mode covers are resolved at once. Returns `{ sessionId, permissionMode }`. On Codex the change applies from the next turn |
 | `GET` | `/sessions/:id/permissions` | `{ pending: string[] }` — the `toolUseID`s still awaiting an answer |
 | `POST` | `/sessions/:id/permission` | Answer an approval. Body: `{ toolUseID, approved: boolean }` |
@@ -165,7 +167,7 @@ Events carry a `seq` field and an SSE `id:`, so a client that reconnects with `L
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `user_prompt` | `prompt`, `attachments?` | The prompt that started the turn |
+| `user_prompt` | `prompt`, `attachments?`, `variant?` | The prompt that started the turn. `variant` is the reasoning level used for this message, when one was requested |
 | `system` | `subtype`, `data` or `session_id` | Agent session initialised |
 | `assistant` | `content`, `parent_tool_use_id?` | Assistant text. On a subagent it carries `parent_tool_use_id` (the parent `task` callID) |
 | `tool_use` | `tool_name`, `tool_input`, `tool_use_id?`, `parent_tool_use_id?` | The agent is calling a tool. Subagent calls carry `parent_tool_use_id` |

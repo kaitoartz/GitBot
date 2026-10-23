@@ -236,6 +236,8 @@ export interface SessionStore {
   agent: "claude-code" | "opencode" | "codex";
   repoPath: string;
   model?: string;
+  /** OpenCode reasoning variant ("low", "high", …), applied per message. */
+  variant?: string;
   mode?: "plan" | "build";
   permissionMode: PermissionMode;
   seq: number;
@@ -261,7 +263,8 @@ export interface SessionStore {
   childToParentTool?: Map<string, string>;
 }
 
-/** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */export interface BotPreset {
+/** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */
+export interface BotPreset {
   id: string;
   name: string;
   instructions: string;

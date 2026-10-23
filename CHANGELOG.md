@@ -73,10 +73,10 @@ Cambios de este fork sobre `gitbot-hq/GitBot` 0.0.9. El upstream no se toca: `ma
 - Nada nuevo se persiste: todo se reconstruye desde OpenCode.
 - `ReasoningPart` plegable quedó fuera de alcance (opcional del plan).
 
-### Pendiente
+### Fase 4 - Razonamiento por mensaje\n\n**Agregado**\n\n- Backend: `POST /chat` acepta `variant` (OpenCode). Se valida contra las variantes que declara el modelo (`400` con la lista si no existe), vive en `SessionStore` y se envía en `promptAsync` sólo si el modelo lo declara. Aplica por mensaje: omitirlo o `null` vuelve al default.\n- `GET /sessions/:id/config` expone `variant`; el evento `user_prompt` lo incluye.\n- UI: selector \"Thinking\" junto a permisos, visible sólo si el modelo declara variantes. Etiqueta \"aplica al próximo mensaje\"; con turno corriendo ofrece \"Restart this turn with …\" (aborta y relanza el mismo prompt, attachments incluidos). La variante activa se muestra en la cabecera.\n- `scripts/smoke-variant.mjs` (13 checks) y `scripts/spikes/opencode-variant.mjs`.\n\n**Notas**\n\n- S4: el hijo de un `task` hereda la variante del padre.\n- Perfiles (`rapido`, `normal`, …) no implementados: no hay config de workspace que los declare; sin variantes el selector no aparece y todo queda como antes.\n\n### Pendiente
 
 - Aceptación manual de la barra de uso en el navegador (colores, conectividad en vivo).
 - Aceptación manual de Fase 2 en el navegador (clip, drag-drop, `@`).
 - Aceptación manual de Fase 3 en el navegador (dos tarjetas en vivo, subagente fallido en rojo, transcript).
-- Fase 4: variante de razonamiento por mensaje.
+- Aceptación manual de Fase 4 en el navegador (selector Thinking, restart con turno activo).
 - Fase 5 (opcional): orquestador que delega a otros bots.

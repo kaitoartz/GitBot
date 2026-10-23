@@ -33,6 +33,7 @@ import { handleMarketplaceRoutes } from "./marketplace-proxy";
 import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BOT_AGENT } from "./bot-store";
 import { botPermissionToSession } from "./server-common";
 import { resolveAttachments, publicAttachment, mentionText, filePartFor, type PendingAttachment } from "./attachments";
+import { getModelInfo } from "./usage";
 import { uiFileFor } from "./static-ui";
 
 export async function handleRequest(
@@ -142,6 +143,7 @@ export async function handleRequest(
         sessionId: store.sdkSessionId,
         agent: store.agent,
         model: store.model ?? null,
+        variant: store.variant ?? null,
         mode: store.mode ?? null,
         permissionMode: store.permissionMode,
       });
@@ -239,7 +241,7 @@ export async function handleRequest(
     // POST /chat
     if (method === "POST" && path === "/chat") {
       const body = await readBody(req);
-      let { repoPath, agent, sessionId: existingId, model, permissionMode } = body;
+      let { repoPath, agent, sessionId: existingId, model, permissionMode, variant } = body;
       const { prompt, attachments, threadId } = body;
       let { mode } = body;
       // attachments: Array<{ url: string }> | undefined
@@ -322,6 +324,34 @@ export async function handleRequest(
 
       let store = existingId ? sessions.get(existingId) : undefined;
 
+      // Reasoning variant is an OpenCode lever, and only for models that
+      // declare it. Validate before the turn starts so a typo is a 400, not
+      // a failed prompt. `null` / "" clears it (model default).
+      if (variant !== undefined && variant !== null && variant !== "") {
+        if (typeof variant !== "string") {
+          jsonError(res, 400, "variant must be a string"); return;
+        }
+        if (agent !== "opencode") {
+          jsonError(res, 400, "variant is only supported with opencode"); return;
+        }
+        const effectiveModel = model ?? store?.model;
+        const slash = effectiveModel ? effectiveModel.indexOf("/") : -1;
+        if (slash > 0) {
+          const info = getModelInfo(effectiveModel!.slice(0, slash), effectiveModel!.slice(slash + 1));
+          if (info && !info.variants.includes(variant)) {
+            jsonError(
+              res,
+              400,
+              `${effectiveModel} does not offer variant '${variant}'` +
+                (info.variants.length ? ` (offers: ${info.variants.join(", ")})` : " (it has no variants)"),
+            );
+            return;
+          }
+        }
+      } else if (variant === "" || variant === null) {
+        variant = undefined;
+      }
+
       // The event is the client-visible contract (metadata only); the bytes
       // ride on the store. Claude Code / Codex keep their legacy `{ url }`
       // shape so nothing changes for them.
@@ -346,19 +376,23 @@ export async function handleRequest(
         store.events = [];
         store.seq = 0;
         if (model) store.model = model;
+        // Per message: omitting the variant means the model default, never
+        // "keep the previous level".
+        store.variant = variant;
         if (mode) store.mode = mode;
         if (permissionMode) store.permissionMode = permissionMode as PermissionMode;
         if (threadId) { store.threadId = threadId; store.botPreset = botPreset; }
         store.pendingAttachments = pendingAttachments;
-        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
+        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(variant ? { variant } : {}), ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
       } else {
         const gitbotId = existingId ?? randomUUID();
         store = createSession(gitbotId, agent, repoPath, model, mode, permissionMode as PermissionMode | undefined, { threadId, preset: botPreset });
+        store.variant = variant;
         if (existingId) {
           store.sdkSessionId = existingId;
         }
         store.pendingAttachments = pendingAttachments;
-        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
+        emitEvent(store, 'user_prompt', { prompt: userPrompt, ...(variant ? { variant } : {}), ...(storedAttachments.length ? { attachments: storedAttachments } : {}) });
         notifyPermissionsChanged();
       }
 
