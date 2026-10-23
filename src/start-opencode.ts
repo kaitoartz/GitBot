@@ -11,6 +11,13 @@ import {
   shouldAutoApprove,
   type SessionStore,
 } from "./server-common";
+import {
+  initContextLimits,
+  parseUsageFromMessage,
+  buildTurnReport,
+  buildSessionReport,
+  accumulateUsage,
+} from "./usage";
 
 async function loadOpencodeSdk() {
   const sdk = await import("@opencode-ai/sdk");
@@ -75,6 +82,11 @@ export async function initAgent(): Promise<boolean> {
   const running = await runningServerVersion();
   if (running !== null) {
     console.log(`  opencode: using the server already running on ${OPENCODE_URL}${running ? ` (opencode ${running})` : ""}`);
+    // Seed the default client and prime the context-window cache so usage
+    // reports know the limits without waiting for a turn.
+    const client = loaded.createOpencodeClient({ baseUrl: OPENCODE_URL });
+    clientsByDir.set("", client);
+    await initContextLimits(client);
     return true;
   }
 
@@ -113,6 +125,7 @@ export async function initAgent(): Promise<boolean> {
     }
     // Seed the default client (no directory) from the spawned server.
     clientsByDir.set("", loaded.createOpencodeClient({ baseUrl: OPENCODE_URL }));
+    await initContextLimits(clientsByDir.get(""));
     console.log(`  opencode: ready (${bin.version})`);
   } catch (err: any) {
     const reason = String(err?.message ?? err).split("\n")[0];
@@ -216,6 +229,13 @@ async function getClientForDir(directory: string): Promise<any> {
     });
   } catch (err: any) {
     console.warn("  permissions: could not set permission config:", err?.message);
+  }
+
+  // Initialize context limits cache on the first client (directory="")
+  if (directory === "") {
+    initContextLimits(client).catch((err) => {
+      console.warn("[usage] failed to initialize context limits:", err?.message);
+    });
   }
 
   startEventStream(client, directory).catch((err) => {
@@ -334,6 +354,14 @@ async function presetTools(
   }
   for (const name of disallowed) tools[name] = false;
   return tools;
+}
+
+/**
+ * A client for ad-hoc SDK reads from outside the driver (usage seeding, etc.).
+ * Reuses the per-directory cache; safe to call repeatedly.
+ */
+export async function getOpencodeClientForDir(directory: string = ""): Promise<any> {
+  return getClientForDir(directory);
 }
 
 export async function getSessionHistory(sdkSessionId: string, directory: string = ""): Promise<{ role: string; content: any[] }[]> {
@@ -464,9 +492,11 @@ async function resolveParentStore(client: any, sdkSessionId: string): Promise<Se
 async function startEventStream(client: any, directory: string) {
   try {
     const events = await client.event.subscribe();
+    console.log(`[event-stream] subscribed (${directory || "no dir"})`);
     for await (const event of events.stream) {
       const type = event.type as string;
       const props = event.properties as any;
+      if (type.startsWith("server.")) continue;
 
       const sdkSessionId = extractSessionId(type, props);
       if (!sdkSessionId) continue;
@@ -490,6 +520,17 @@ async function startEventStream(client: any, directory: string) {
         if (info?.id && info?.role) {
           if (!(store as any)._msgRoles) (store as any)._msgRoles = new Map<string, string>();
           (store as any)._msgRoles.set(info.id, info.role);
+        }
+        // Emit usage events for assistant messages only (ignore child events)
+        if (info?.role === "assistant" && !isChildEvent) {
+          const snapshot = parseUsageFromMessage(props);
+          if (snapshot) {
+            const report = buildTurnReport(info.id, snapshot, store.model);
+            if (report) {
+              accumulateUsage(store.gitbotId, snapshot, info.id);
+              emitEvent(store, "usage", report);
+            }
+          }
         }
       }
 
@@ -606,6 +647,21 @@ async function startEventStream(client: any, directory: string) {
 
       if (type === "session.idle" || (type === "session.status" && props?.status?.type === "idle")) {
         if (store.status === "done") continue;
+        // Emit final session usage report with context window
+        let providerID: string | undefined;
+        let modelID: string | undefined;
+        if (store.model) {
+          const slashIdx = store.model.indexOf("/");
+          if (slashIdx !== -1) {
+            providerID = store.model.slice(0, slashIdx);
+            modelID = store.model.slice(slashIdx + 1);
+          }
+        }
+        const sessionReport = buildSessionReport(
+          store, providerID, modelID,
+          store.threadId ? `thread:${store.threadId}` : undefined,
+        );
+        emitEvent(store, "usage", sessionReport);
         recordSetupOutcomeFromEvents(store);
         store.status = "done";
         store.pendingPermissions.clear();

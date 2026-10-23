@@ -127,6 +127,8 @@ gitbot start
 
 No apuntes `GITBOT_OPENCODE_BIN` al `opencode` v2 del PATH: la API cambió y los turnos fallan.
 
+**Cuidado con el server largo vivo.** El server 1.19.3 administra los eventos **por instancia/directorio**: `/event` sin header `x-opencode-directory` no entrega eventos de sesión. Después de horas de churn (múltiples clientes, `config.update` repetidos, instancias creadas/desechadas) puede quedarse en un estado donde la subscripción de GitBot recibe `server.connected` + `server.instance.disposed` y luego muere: los turnos corren, pero el panel no ve nada en vivo. Se arregla matando el server de OpenCode y dejando que GitBot levante uno fresco.
+
 ---
 
 ## 6. El `gitbot` global apunta a este clone

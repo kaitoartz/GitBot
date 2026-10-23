@@ -5,6 +5,7 @@ import {
   parseQuery,
   IRequest,
   IResponse,
+  sessions,
 } from "./server-common";
 import {
   listBots,
@@ -28,6 +29,8 @@ import { existsSync, statSync } from "fs";
 import { loadTranscript } from "./start-claude-code";
 import { loadTranscript as loadCodexTranscript } from "./start-codex";
 import { getSessionHistory as loadOpencodeHistory } from "./start-opencode";
+import { getOpencodeClientForDir } from "./start-opencode";
+import { buildSessionReport, loadHistoricalUsage, isSeeded, liveMessageIdsOf } from "./usage";
 
 /**
  * REST surface for the bot hub: bots, their threads, and a thread's messages.
@@ -171,6 +174,48 @@ export async function handleBotRoutes(
           ? await loadOpencodeHistory(thread.sdkSessionId, thread.repoPath)
           : await loadTranscript(thread.sdkSessionId, thread.repoPath);
     jsonOk(res, { messages });
+    return true;
+  }
+
+  // /threads/:id/usage must be matched before /threads/:id
+  const usageId = matchId(path, "/threads/", "/usage");
+  if (usageId && method === "GET") {
+    const thread = getThread(usageId);
+    if (!thread) { jsonError(res, 404, "Thread not found"); return true; }
+    // Only OpenCode tracks usage; other agents return empty data
+    if (thread.agent !== "opencode") {
+      jsonOk(res, { usage: null });
+      return true;
+    }
+    const threadKey = `thread:${thread.id}`;
+    // Find the active session store for this thread, if a turn is running.
+    const activeStore = [...sessions.values()].find(s => s.threadId === thread.id);
+    const liveGitbotId = activeStore?.gitbotId;
+    // Seed the historical total once per process, from OpenCode itself.
+    // Mid-turn, messages the live layer already counted are excluded, so
+    // seeded + live never doubles up.
+    if (thread.sdkSessionId && !isSeeded(threadKey)) {
+      await loadHistoricalUsage(
+        await getOpencodeClientForDir(thread.repoPath),
+        thread.sdkSessionId,
+        threadKey,
+        liveGitbotId ? liveMessageIdsOf(liveGitbotId) : undefined,
+      );
+    }
+    let providerID: string | undefined;
+    let modelID: string | undefined;
+    // The model rides on the bot, not on the thread.
+    const model = getBot(thread.botId)?.model;
+    if (model) {
+      const slashIdx = model.indexOf("/");
+      if (slashIdx !== -1) {
+        providerID = model.slice(0, slashIdx);
+        modelID = model.slice(slashIdx + 1);
+      }
+    }
+    const store = activeStore ?? { gitbotId: threadKey, model };
+    const report = buildSessionReport(store, providerID, modelID, threadKey);
+    jsonOk(res, { usage: report });
     return true;
   }
 

@@ -69,7 +69,8 @@ A thread is one conversation between a bot and a folder.
 | `GET` | `/threads/:id` | `{ thread }` |
 | `PATCH` | `/threads/:id` | Update a thread, e.g. `{ title }` |
 | `DELETE` | `/threads/:id` | Delete the thread. The agent's own transcript stays on disk |
-| `GET` | `/threads/:id/messages` | `{ messages }` — history read from the transcript of the agent the thread runs on |
+| `GET` | `/threads/:id/messages` | `{ messages }` - history read from the transcript of the agent the thread runs on |
+| `GET` | `/threads/:id/usage` | [Usage](#usage) report for OpenCode threads, `null` otherwise |
 
 A thread records `agent` and `sdkSessionId` on its first turn and keeps them: a session id only means something to the agent that issued it. Other fields: `kind` (`chat` \| `setup`), `title`, `repoPath`, `preview`, `messageCount`, `createdAt`, `updatedAt`.
 
@@ -147,6 +148,7 @@ Events carry a `seq` field and an SSE `id:`, so a client that reconnects with `L
 | `permission_request` | `toolUseID`, `toolName`, `input` | The agent needs approval (Claude Code, OpenCode — Codex never asks; its permission mode selects a sandbox) |
 | `result` | `subtype`, `cost`, `duration_ms`, `num_turns` | Turn statistics (Claude Code) |
 | `agent_error` | `message` | The agent itself reported a problem — provider refused, bad model (OpenCode); a connection retry or transport fallback (Codex). Not terminal on its own: it is followed by a terminal event only if the turn actually fails |
+| `usage` | `scope`, `usage`, `messageID?`, `context?`, `model?` | Token/cost accounting (OpenCode only). `scope: "turn"` rides along after a real assistant snapshot (`messageID` names its message); `scope: "session"` lands once at turn end with the cumulative total and the resolved context window. See [Usage](#usage) |
 | `done` | — | Turn finished |
 | `aborted` | `message` | Turn was stopped |
 | `error` | `message` | Turn failed |
@@ -158,3 +160,38 @@ Events carry a `seq` field and an SSE `id:`, so a client that reconnects with `L
 | `permissions` | `permissions[]` | Full snapshot of pending approvals |
 
 Each entry has `sessionId`, `agent`, `repoPath`, `repoName`, `toolUseID`, `toolName` and `input`.
+
+## Usage
+
+OpenCode threads report tokens, cost and context. Numbers arrive once per
+assistant message, at step-finish (OpenCode sends a zero placeholder first;
+that one is never emitted). The `usage` object:
+
+```json
+{
+  "input": 182,        // prompt tokens, excluding cache reads
+  "output": 2,
+  "reasoning": 0,
+  "cacheRead": 32512,
+  "cacheWrite": 0,
+  "cost": 0,
+  "total": 32696
+}
+```
+
+- `total` = input + output + reasoning + cacheRead + cacheWrite.
+- Cost depends on the provider; many report `0`.
+- The **window** (how much of the model's context is in use) is the newest
+  assistant message's `input + cacheRead + cacheWrite` — not the sum across
+  turns, because every turn re-reads the cache. It travels in `context`:
+
+```json
+{ "used": 123602, "limit": 1048576, "pct": 12 }
+```
+
+`limit` comes from OpenCode's `config.providers()` and is `null` (with no
+percentage) when the model does not declare one.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/threads/:id/usage` | A thread's usage: `usage` (session-scoped report above) or `null` for non-OpenCode agents. Seeds the historical total from OpenCode once per process; restarts do not lose it |

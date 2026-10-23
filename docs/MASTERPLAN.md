@@ -120,6 +120,15 @@ Cada fase termina en un estado usable y demostrable. El orden está pensado para
 
 **Riesgo principal:** doble conteo entre histórico y deltas → mitigado con clave `messageID` y test manual de "abrir hilo a mitad de turno".
 
+**Estado: completada.** Resultados:
+
+- `src/usage.ts`: normalizador (dedupe por `messageID` + `total` + `cost`; el snapshot en cero que abre cada mensaje no se emite), límites de contexto cacheados de `config.providers()` al arrancar (`result.data.providers`; `models` llega como registro con ids con slash), y dos capas de acumulado: histórico sembrado por hilo (`thread:<id>`, una vez por proceso desde `session.messages`) + deltas en vivo por sesión de GitBot.
+- **Corrección de diseño al probar:** la ventana de contexto no es el sumatorio de turnos (cada turno reintenta el cache; un hilo con 7.8M de tokens acumulados daba "747%"). `context.used` es el footprint del **último** mensaje assistant (`input + cacheRead + cacheWrite`). En el seed reshape se saca de `session.messages` hacia atrás.
+- Evento SSE `usage` (turn al llegar el snapshot real, session al cerrar el turno) y `GET /threads/:id/usage` documentados en `docs/API.md`.
+- UI: `UsageBar` sobre el composer con `contexto % · used/limit` (verde <60%, ámbar <85%, rojo ≥85%), `turno $x`, `hilo $x`, tokens in/out y desglose expandible. `EventSource` solo abierto durante un turno activo (el stream 404ea para hilos en reposo) y cerrado en error — sin bucle de reconexión.
+- Smoke test `scripts/smoke-usage.mjs`: turno real contra `1.19.3` — snapshot de turno relevante en ~16 s (step-finish), reporte de sesión con `context {used, limit, pct}` resuelto, y REST post-turno idéntico al evento de sesión.
+- Pendiente de aceptación manual: color/ámbito visual de la barra en el navegador.
+
 ---
 
 ### Fase 2 — Adjuntar archivos

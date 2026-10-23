@@ -47,6 +47,7 @@ import { parseMarketplaceListing, type MarketplaceListing } from "../lib/marketp
 import { presentSetupText, readSetupNeedsInput } from "../lib/setup";
 import RunSummary, { ActionRow } from "./run-summary";
 import QueueTray from "./queue-tray";
+import UsageBar from "./usage-bar";
 
 // Ordered segments: text and tool calls interleave exactly as they
 // arrived, so a turn reads text → tool → text → tool instead of all
@@ -1612,16 +1613,23 @@ export default function Chat({
           </div>
         </div>
       ) : (
-        <form
-          className="composer"
-          onSubmit={(e) => {
-            e.preventDefault();
-            sendPrompt(draft);
-            resetBox();
-          }}
-        >
-          {jumpLatest}
-          <QueueTray
+        <>
+          <UsageBar
+            threadId={thread?.id ?? null}
+            sessionId={sessionRef.current}
+            agent={thread?.agent ?? "opencode"}
+            streaming={streaming}
+          />
+          <form
+            className="composer"
+            onSubmit={(e) => {
+              e.preventDefault();
+              sendPrompt(draft);
+              resetBox();
+            }}
+          >
+            {jumpLatest}
+            <QueueTray
             text={queue}
             /* Steering disabled — kept for reference. */
             /* onSteer={steerNow} */
@@ -1736,7 +1744,8 @@ export default function Chat({
               </button>
             )}
           </div>
-        </form>
+          </form>
+        </>
       )}
     </main>
   );
