@@ -12,7 +12,19 @@ import {
 // file extraction. Both the live timeline and the end-of-turn run card
 // speak this language, so a turn reads the same alive and archived.
 
-export type ToolChip = { name: string; input: unknown };
+export type ToolChip = {
+  name: string;
+  input: unknown;
+  /** OpenCode callID; lets a `task` row find its subagent card. */
+  id?: string;
+  /** Only on `task` rows: the child session behind it. */
+  subagent?: {
+    childSessionId: string;
+    agent?: string | null;
+    title?: string | null;
+    status?: string | null;
+  };
+};
 
 // Tool input preview, mirroring the original client: raw string as-is,
 // otherwise JSON, capped at 200 chars (the command, the folder, …).

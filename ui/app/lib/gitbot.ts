@@ -45,11 +45,24 @@ export type ThreadFull = Thread & {
   updatedAt: string;
 };
 
+export type HistorySubagent = {
+  childSessionId: string;
+  agent?: string | null;
+  title?: string | null;
+  status?: string | null;
+};
+
 export type HistoryBlock = {
   type: string;
   text?: string;
   tool_name?: string;
   tool_input?: unknown;
+  tool_use_id?: string;
+  /** Present on a `task` tool block: the subagent it spawned. */
+  subagent?: HistorySubagent;
+  url?: string;
+  name?: string;
+  mime?: string;
 };
 
 export type HistoryMsg = {

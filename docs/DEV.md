@@ -73,6 +73,7 @@ node --test ui/scripts/attachments.test.mjs  # @menciones y tipos
 
 # turno real contra un `gitbot start` aislado (data dir temporal, puerto 3100)
 node scripts/smoke-attachments.mjs
+node scripts/smoke-subagents.mjs   # task → tarjetas, uso del hijo y transcript
 ```
 
 El spike S1 (`scripts/spikes/opencode-file-parts.mjs`) sigue disponible para

@@ -32,6 +32,7 @@ import {
   getModelCapabilities,
   getPendingPermissions,
   getSessionConfig,
+  getSessionHistory,
   getSessionStatus,
   patchPermissionMode,
   postAbort,
@@ -60,7 +61,7 @@ import type { AvatarPref } from "../lib/avatar-prefs";
 import { useMascotPointerFollow } from "../lib/use-mascot-pointer-follow";
 import { useScrollEdge } from "../lib/use-scroll-edge";
 import { useStatusFavicon } from "../lib/status-favicon";
-import { groupTools, type ToolChip } from "../lib/tool-ui";
+import { groupTools, toolSummary, type ToolChip } from "../lib/tool-ui";
 import { parseMarketplaceListing, type MarketplaceListing } from "../lib/marketplace-publish";
 import { presentSetupText, readSetupNeedsInput } from "../lib/setup";
 import RunSummary, { ActionRow } from "./run-summary";
@@ -75,6 +76,18 @@ type Seg =
   | { kind: "tools"; tools: ToolChip[] };
 /** A file part that rode with a message: an image preview or a PDF chip. */
 type FileChip = { name: string; mime: string; url: string };
+/** One subagent of the current turn, rebuilt from `subagent` + child events. */
+type LiveSubagent = {
+  parentToolUseId: string;
+  childSessionId?: string;
+  agent?: string;
+  title?: string;
+  status: "running" | "finished" | "error";
+  text: string;
+  tools: ToolChip[];
+  cost: number;
+  tokens: number;
+};
 type Msg = {
   id: string;
   role: "user" | "assistant";
@@ -99,6 +112,13 @@ function flatten(
     text?: string;
     tool_name?: string;
     tool_input?: unknown;
+    tool_use_id?: string;
+    subagent?: {
+      childSessionId: string;
+      agent?: string | null;
+      title?: string | null;
+      status?: string | null;
+    };
     url?: string;
     name?: string;
     mime?: string;
@@ -111,10 +131,11 @@ function flatten(
     if (last && last.kind === "text") last.text += `\n\n${text}`;
     else segs.push({ kind: "text", text });
   };
-  const pushTool = (name: string, input: unknown) => {
+  const pushTool = (name: string, input: unknown, extra?: Pick<ToolChip, "id" | "subagent">) => {
+    const chip: ToolChip = { name, input, ...extra };
     const last = segs[segs.length - 1];
-    if (last && last.kind === "tools") last.tools.push({ name, input });
-    else segs.push({ kind: "tools", tools: [{ name, input }] });
+    if (last && last.kind === "tools") last.tools.push(chip);
+    else segs.push({ kind: "tools", tools: [chip] });
   };
   for (const b of content ?? []) {
     if (
@@ -124,7 +145,10 @@ function flatten(
     ) {
       pushText(b.text as string);
     } else if (b.type === "tool_use" && b.tool_name) {
-      pushTool(String(b.tool_name), b.tool_input);
+      pushTool(String(b.tool_name), b.tool_input, {
+        ...(b.tool_use_id ? { id: b.tool_use_id } : {}),
+        ...(b.subagent ? { subagent: b.subagent } : {}),
+      });
     } else if ((b.type === "image_url" || b.type === "file") && b.url) {
       attachments.push({
         name: b.name ?? (b.type === "image_url" ? "image" : "attachment"),
@@ -139,6 +163,13 @@ function flatten(
 function errText(e: unknown) {
   if (e instanceof ApiError) return e.message;
   return e instanceof Error ? e.message : "Something went wrong";
+}
+
+/** Task rows of an archived message — one per subagent it spawned. */
+function subagentsOf(m: Msg): ToolChip[] {
+  return m.segs
+    .flatMap((s) => (s.kind === "tools" ? s.tools : []))
+    .filter((t) => t.subagent?.childSessionId);
 }
 
 /** Image previews and PDF chips attached to a message (live or history). */
@@ -170,6 +201,135 @@ function MessageAttachments({ files }: { files: FileChip[] }) {
 }
 
 // Assistant markdown (GFM). Raw HTML is off by default — no XSS surface.
+function SubagentCard({
+  title,
+  agent,
+  status,
+  text,
+  tools,
+  cost,
+  tokens,
+  childSessionId,
+  onTranscript,
+}: {
+  title?: string;
+  agent?: string;
+  status: "running" | "finished" | "error";
+  text?: string;
+  tools: ToolChip[];
+  cost?: number;
+  tokens?: number;
+  childSessionId?: string;
+  onTranscript?: (sessionId: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className={`subagent-card ${status}`}>
+      <button
+        type="button"
+        className="subagent-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="subagent-dot" aria-hidden="true" />
+        <span className="subagent-title">{title || "Subagent"}</span>
+        {agent ? <span className="subagent-agent">{agent}</span> : null}
+        <span className="subagent-status">
+          {status === "running" ? "running" : status === "error" ? "failed" : "done"}
+        </span>
+        <AnimatedActionIcon
+          icon={ChevronDownIcon}
+          size={12}
+          aria-hidden="true"
+          className={open ? "act-swap open" : "act-swap"}
+        />
+      </button>
+      {open && (
+        <div className="subagent-body">
+          {text?.trim() ? (
+            <div className="subagent-text">
+              <RichText text={text} />
+            </div>
+          ) : null}
+          {tools.length > 0 && (
+            <ul className="subagent-tools">
+              {tools.slice(-40).map((t, i) => (
+                <li key={`${t.id ?? t.name}-${i}`}>
+                  <b>{t.name}</b>
+                  <span>{toolSummary(t.input)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {tools.length > 40 && (
+            <p className="subagent-more">+{tools.length - 40} earlier calls</p>
+          )}
+          <div className="subagent-foot">
+            {typeof cost === "number" && cost > 0 ? <span>${cost.toFixed(4)}</span> : null}
+            {tokens ? <span>{tokens.toLocaleString()} tokens</span> : null}
+            {childSessionId && onTranscript ? (
+              <button
+                type="button"
+                className="subagent-link"
+                onClick={() => onTranscript(childSessionId)}
+              >
+                View transcript
+              </button>
+            ) : null}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubagentTranscript({
+  title,
+  messages,
+  loading,
+  error,
+  onClose,
+}: {
+  title: string;
+  messages: Msg[];
+  loading: boolean;
+  error: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="subagent-panel" role="dialog" aria-label={`${title} transcript`}>
+      <header className="subagent-panel-head">
+        <b>{title}</b>
+        <button type="button" className="icon-btn" onClick={onClose} aria-label="Close transcript">
+          <XIcon size={15} aria-hidden="true" />
+        </button>
+      </header>
+      <div className="subagent-panel-body">
+        {loading ? <LoadingState label="Loading transcript" variant="Drive" /> : null}
+        {error ? <p className="chat-error">{error}</p> : null}
+        {messages.map((m) => (
+          <div key={m.id} className={`subagent-msg ${m.role}`}>
+            {m.segs.map((s, i) =>
+              s.kind === "text" ? (
+                <RichText key={i} text={s.text} />
+              ) : (
+                <ul key={i} className="subagent-tools">
+                  {s.tools.map((t, j) => (
+                    <li key={j}>
+                      <b>{t.name}</b>
+                      <span>{toolSummary(t.input)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ),
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function MarketplaceListingCard({ listing, color }: { listing: MarketplaceListing; color?: string }) {
   const mascot = typeof listing.mascot === "string" ? listing.mascot : listing.mascot?.body;
   const listingColor = listing.color || (typeof listing.mascot === "object" ? `var(--${listing.mascot.color})` : color);
@@ -480,6 +640,14 @@ export default function Chat({
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [activity, setActivity] = useState<string | null>(null);
+  const [subagents, setSubagents] = useState<Record<string, LiveSubagent>>({});
+  const subagentsRef = useRef<Record<string, LiveSubagent>>({});
+  const [transcript, setTranscript] = useState<{
+    title: string;
+    messages: Msg[];
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
   const [perms, setPerms] = useState<(PermRequest & { verdict?: boolean })[]>([]);
   const [turnError, setTurnError] = useState<string | null>(null);
   // Single "up next" slot: the server runs one turn per thread (a second
@@ -948,6 +1116,46 @@ export default function Chat({
     });
   }
 
+  function patchSubagent(id: string, patch: Partial<LiveSubagent>) {
+    const prev = subagentsRef.current;
+    const cur: LiveSubagent = prev[id] ?? {
+      parentToolUseId: id,
+      status: "running",
+      text: "",
+      tools: [],
+      cost: 0,
+      tokens: 0,
+    };
+    const next = { ...prev, [id]: { ...cur, ...patch } };
+    subagentsRef.current = next;
+    setSubagents(next);
+  }
+
+  /** Append a child's text or tool call to its card (never to the parent). */
+  function appendSubagentText(id: string, chunk: string) {
+    const cur = subagentsRef.current[id];
+    patchSubagent(id, { text: (cur?.text ? `${cur.text}\n\n` : "") + chunk });
+  }
+
+  function appendSubagentTool(id: string, chip: ToolChip) {
+    const cur = subagentsRef.current[id];
+    patchSubagent(id, { tools: [...(cur?.tools ?? []), chip] });
+  }
+
+  async function openTranscript(childSessionId: string, title: string) {
+    setTranscript({ title, messages: [], loading: true, error: null });
+    try {
+      const { messages } = await getSessionHistory(childSessionId, thread?.repoPath);
+      const flat: Msg[] = (messages ?? []).map((m, i) => {
+        const parsed = flatten(m.role, m.content ?? []);
+        return { id: `st-${i}`, role: parsed.role, segs: parsed.segs, attachments: parsed.attachments };
+      });
+      setTranscript({ title, messages: flat, loading: false, error: null });
+    } catch (e) {
+      setTranscript({ title, messages: [], loading: false, error: errText(e) });
+    }
+  }
+
   function appendLiveTool(chip: ToolChip) {
     pendingTools.current.push(chip);
     setLive((prev) => {
@@ -1084,16 +1292,56 @@ export default function Chat({
     };
     es.addEventListener("assistant", (ev) => {
       if (catchupRef.current) return;
+      const d = data(ev);
+      const chunk = String(d.content ?? "");
+      const parent = typeof d.parent_tool_use_id === "string" ? d.parent_tool_use_id : undefined;
+      if (parent) {
+        if (chunk) appendSubagentText(parent, chunk);
+        return;
+      }
       ensureLive();
-      const chunk = String(data(ev).content ?? "");
       if (chunk) { setActivity("Writing…"); appendLiveText(chunk); }
     });
     es.addEventListener("tool_use", (ev) => {
       if (catchupRef.current) return;
-      ensureLive();
       const d = data(ev);
+      const chip: ToolChip = {
+        name: String(d.tool_name ?? "tool"),
+        input: d.tool_input,
+        ...(typeof d.tool_use_id === "string" ? { id: d.tool_use_id } : {}),
+      };
+      const parent = typeof d.parent_tool_use_id === "string" ? d.parent_tool_use_id : undefined;
+      if (parent) {
+        appendSubagentTool(parent, chip);
+        return;
+      }
+      ensureLive();
       setActivity(`Running ${d.tool_name || "tool"}…`);
-      appendLiveTool({ name: String(d.tool_name ?? "tool"), input: d.tool_input });
+      appendLiveTool(chip);
+    });
+    // A Task spawned a child session (or it changed state). The card lives
+    // under the parent's Task row; child text/tools/usage flow into it.
+    es.addEventListener("subagent", (ev) => {
+      const d = data(ev);
+      const id = typeof d.parentToolUseId === "string" ? d.parentToolUseId : "";
+      if (!id) return;
+      const phase = String(d.phase ?? "started");
+      patchSubagent(id, {
+        ...(typeof d.childSessionId === "string" ? { childSessionId: d.childSessionId } : {}),
+        ...(typeof d.agent === "string" ? { agent: d.agent } : {}),
+        ...(typeof d.title === "string" ? { title: d.title } : {}),
+        status: phase === "error" ? "error" : phase === "finished" ? "finished" : "running",
+      });
+    });
+    es.addEventListener("usage", (ev) => {
+      const d = data(ev);
+      const parent = typeof d.parent_tool_use_id === "string" ? d.parent_tool_use_id : undefined;
+      if (!parent) return;
+      const cur = subagentsRef.current[parent];
+      patchSubagent(parent, {
+        cost: (cur?.cost ?? 0) + Number(d.usage?.cost ?? 0),
+        tokens: (cur?.tokens ?? 0) + Number(d.usage?.total ?? 0),
+      });
     });
     es.addEventListener("status", (ev) => {
       const d = data(ev);
@@ -1344,6 +1592,8 @@ export default function Chat({
     if (threadRef.current) drafts.current[threadRef.current] = "";
     setTurnError(null);
     setPerms([]);
+    subagentsRef.current = {};
+    setSubagents({});
     setOpenGroups({});
     pendingTools.current = [];
     pendingRun.current = null;
@@ -1706,6 +1956,18 @@ export default function Chat({
                 ) : null,
               )}
               {m.role === "assistant" &&
+                subagentsOf(m).map((t, i) => (
+                  <SubagentCard
+                    key={t.id ?? `${t.name}-${i}`}
+                    title={t.subagent?.title ?? undefined}
+                    agent={t.subagent?.agent ?? undefined}
+                    status={t.subagent?.status === "error" ? "error" : "finished"}
+                    tools={[]}
+                    childSessionId={t.subagent?.childSessionId}
+                    onTranscript={(sid) => openTranscript(sid, t.subagent?.title || "Subagent")}
+                  />
+                ))}
+              {m.role === "assistant" &&
                 m.segs.some((s) => s.kind === "tools" && s.tools.length > 0) && (
                   <RunSummary
                     tools={m.segs.flatMap((s) => s.kind === "tools" ? s.tools : [])}
@@ -1767,7 +2029,30 @@ export default function Chat({
                 </Fragment>
               ),
             )}
+            {Object.values(subagents).map((s) => (
+              <SubagentCard
+                key={s.parentToolUseId}
+                title={s.title}
+                agent={s.agent}
+                status={s.status}
+                text={s.text}
+                tools={s.tools}
+                cost={s.cost}
+                tokens={s.tokens}
+                childSessionId={s.childSessionId}
+                onTranscript={(sid) => openTranscript(sid, s.title || s.agent || "Subagent")}
+              />
+            ))}
           </article>
+        )}
+        {transcript && (
+          <SubagentTranscript
+            title={transcript.title}
+            messages={transcript.messages}
+            loading={transcript.loading}
+            error={transcript.error}
+            onClose={() => setTranscript(null)}
+          />
         )}
         {loading && (thread.messageCount === 0 && !setup
           ? <ConversationEmptySkeleton />

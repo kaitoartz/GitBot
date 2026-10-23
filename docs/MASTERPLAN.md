@@ -182,35 +182,22 @@ Dos caminos, porque adjuntar código y adjuntar una imagen no son el mismo probl
 
 ### Fase 3 — Subagentes en vivo
 
-**Estado actual:** OpenCode ya resuelve ancestría por `parentID` y etiqueta eventos hijos con `parent_tool_use_id`, pero:
+**Estado:** hecha (S3 resuelto el 2026-10-23). El part `task` trae `state.metadata.sessionId` (y `parentSessionId`), así que el vínculo es exacto: no hace falta la heurística ni `session.children`.
 
-- el vínculo `task` → sesión hija es heurístico ("último task visto"),
-- la UI ignora `parent_tool_use_id`,
-- los `reasoning` parts no se muestran,
-- no hay forma de abrir el transcript de un subagente.
+**Hecho**
 
-**Trabajo**
+- Spike `scripts/spikes/opencode-events.mjs` con un prompt que dispara `task`; volcado en `.spike-opencode/`.
+- `src/start-opencode.ts`: `trackTaskSubagent` registra `childSessionId → parentToolUseId` al ver el part y calienta el cache de ancestría. Evento `subagent` (`started` / `finished` / `error`) con agente y título. `assistant`, `tool_use` y `usage` de hijos llevan `parent_tool_use_id` real.
+- Uso del hijo: entra al total del turno pero **no** a la ventana de contexto del padre (`accumulateUsage` con `updateWindow:false`); el evento `usage` del hijo lleva `parent_tool_use_id` para que la tarjeta sume su costo/tokens.
+- Historial: el bloque `tool_use` de un `task` incluye `tool_use_id` y `subagent { childSessionId, agent, title, status }`; el transcript del hijo se lee por el endpoint existente `GET /sessions/:id/history`.
+- UI: tarjeta colapsable por subagente (título, agente, estado en color, texto y tools en vivo, costo/tokens) y panel lateral "View transcript". En hilos reabiertos las tarjetas se reconstruyen del historial y el transcript se pide al abrir.
+- `scripts/smoke-subagents.mjs`: 10/10 contra GitBot + OpenCode 1.19.3 (eventos, uso del hijo, historial y transcript).
 
-1. Spike S3: confirmar si el part de la tool `task` trae el `sessionId` del hijo en su metadata (en ese caso se reemplaza la heurística por el vínculo real).
-2. Backend (`src/start-opencode.ts`):
-   - `Map<childSessionId, parentToolUseId>` poblado al detectar el part `task` + `session.children`.
-   - Evento nuevo `subagent` con `{ phase: "started" | "finished" | "error", parentToolUseId, childSessionId, agent, title }`.
-   - Adjuntar `parent_tool_use_id` a `assistant`, `tool_use` y `usage` de hijos (ya casi está).
-   - Propagar tokens/costo del hijo al total del turno y exponer `usage.children[]`.
-3. UI:
-   - Bajo la fila del `Task`, una tarjeta colapsable por subagente: agente, título, estado, contador de tools, tokens y costo.
-   - Contenido en vivo (texto + tools) dentro de la tarjeta, con scroll propio.
-   - Botón "ver transcript" → panel lateral que lee `session.messages(childId)` (histórico incluido).
-   - Indicador agregado en la barra de estado: `2 subagentes activos`.
-4. Opcional barato: render de `ReasoningPart` como bloque plegable "razonamiento".
-
-**Aceptación**
-
-- Pedir una tarea que dispare subagentes: se ven al menos dos tarjetas, cada una con sus tools y su costo, actualizándose en vivo.
-- Al reabrir el hilo, los subagentes del turno anterior aparecen con su transcript (releído de OpenCode).
-- Un subagente que falla se muestra en rojo sin romper el hilo padre.
+**Pendiente de aceptación manual:** ver dos tarjetas animándose a la vez y un subagente fallido en rojo en el navegador.
 
 **Nota de diseño:** no se persiste nada nuevo; todo se reconstruye desde OpenCode.
+
+**Opcional no hecho:** render de `ReasoningPart` como bloque plegable.
 
 ---
 

@@ -10,6 +10,7 @@ import {
   notifyPermissionsChanged,
   shouldAutoApprove,
   type SessionStore,
+  type SessionSubagent,
 } from "./server-common";
 import {
   initContextLimits,
@@ -431,7 +432,26 @@ export async function getSessionHistory(sdkSessionId: string, directory: string 
             } catch {
               tool_input = "";
             }
-            blocks.push({ type: "tool_use", tool_name: toolName, tool_input });
+            const md = p.state?.metadata ?? {};
+            const childSessionId = typeof md.sessionId === "string" ? md.sessionId : undefined;
+            blocks.push({
+              type: "tool_use",
+              tool_name: toolName,
+              tool_input,
+              ...(p.callID ? { tool_use_id: p.callID } : {}),
+              // A Task row keeps the link to its subagent so history can render
+              // the card and fetch the child transcript on demand.
+              ...(toolName === "task" && childSessionId
+                ? {
+                    subagent: {
+                      childSessionId,
+                      agent: p.state?.input?.subagent_type ?? null,
+                      title: p.state?.title ?? p.state?.input?.description ?? null,
+                      status: p.state?.status ?? null,
+                    },
+                  }
+                : {}),
+            });
           }
         }
         if (blocks.length) history.push({ role, content: blocks });
@@ -537,6 +557,43 @@ function finalizeTurn(store: SessionStore): void {
 /** A turn younger than this may still be starting; never reconcile it away. */
 const RECONCILE_MIN_AGE_MS = 5000;
 
+/**
+ * Bind a `task` tool part to its child session. S3 proved the part carries
+ * `state.metadata.sessionId` (and `parentSessionId`), so the mapping is exact:
+ * no need to guess which child belongs to which Task row, and no extra
+ * `session.children` round-trip.
+ */
+function trackTaskSubagent(store: SessionStore, part: any): void {
+  const md = part.state?.metadata ?? {};
+  const childSessionId = typeof md.sessionId === "string" && md.sessionId ? md.sessionId : undefined;
+  const parentToolUseId = typeof part.callID === "string" && part.callID ? part.callID : undefined;
+  if (!childSessionId || !parentToolUseId) return;
+
+  const raw = part.state?.status;
+  const status: SessionSubagent["status"] =
+    raw === "completed" ? "completed" : raw === "error" ? "error" : "running";
+
+  if (!store.subagents) store.subagents = new Map();
+  if (!store.childToParentTool) store.childToParentTool = new Map();
+  const prev = store.subagents.get(parentToolUseId);
+  const agent =
+    typeof part.state?.input?.subagent_type === "string" ? part.state.input.subagent_type : prev?.agent;
+  const title =
+    typeof part.state?.title === "string" && part.state.title ? part.state.title : prev?.title;
+
+  const entry: SessionSubagent = { parentToolUseId, childSessionId, agent, title, status };
+  store.subagents.set(parentToolUseId, entry);
+  store.childToParentTool.set(childSessionId, parentToolUseId);
+  // Warm the child→root cache with the exact link, so child events route
+  // immediately instead of waiting for a parentID walk.
+  childSdkIdToRootGitbotId.set(childSessionId, store.gitbotId);
+
+  if (prev && prev.status === status) return;
+  emitEvent(store, "subagent", {
+    phase: status === "completed" ? "finished" : status === "error" ? "error" : "started",
+    ...entry,
+  });
+}
 /** Guards for reconciliation, exported so the rules are unit-testable. */
 export function shouldReconcileTurn(store: SessionStore, now = Date.now()): boolean {
   if (store.agent !== "opencode" || store.status !== "running" || !store.sdkSessionId) return false;
@@ -621,6 +678,12 @@ async function startEventStream(client: any, directory: string) {
       // so its sdkSessionId differs from the event's sdkSessionId.
       const isChildEvent = sdkSessionId !== store.sdkSessionId;
 
+      // Real link when the parent `task` part exposed its child session;
+      // `lastTaskToolUseId` stays as the fallback for older parts.
+      const parentToolUseId = isChildEvent
+        ? store.childToParentTool?.get(sdkSessionId) ?? store.lastTaskToolUseId
+        : undefined;
+
       // Track message roles so we can filter out user message parts
       if (type === "message.updated") {
         const info = props.info;
@@ -628,14 +691,18 @@ async function startEventStream(client: any, directory: string) {
           if (!(store as any)._msgRoles) (store as any)._msgRoles = new Map<string, string>();
           (store as any)._msgRoles.set(info.id, info.role);
         }
-        // Emit usage events for assistant messages only (ignore child events)
-        if (info?.role === "assistant" && !isChildEvent) {
+        // Usage for the parent and for children: a subagent's tokens count
+        // toward the turn total but not toward the parent's context window.
+        if (info?.role === "assistant") {
           const snapshot = parseUsageFromMessage(props);
           if (snapshot) {
             const report = buildTurnReport(info.id, snapshot, store.model);
             if (report) {
-              accumulateUsage(store.gitbotId, snapshot, info.id);
-              emitEvent(store, "usage", report);
+              accumulateUsage(store.gitbotId, snapshot, info.id, { updateWindow: !isChildEvent });
+              emitEvent(store, "usage", {
+                ...report,
+                ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+              });
             }
           }
         }
@@ -644,7 +711,6 @@ async function startEventStream(client: any, directory: string) {
       if (type === "message.part.updated") {
         const part = props.part;
         const msgRole = (store as any)._msgRoles?.get(part.messageID);
-        const parentToolUseId = isChildEvent ? store.lastTaskToolUseId : undefined;
 
         if (part.type === "text") {
           const text = part.text ?? "";
@@ -661,10 +727,11 @@ async function startEventStream(client: any, directory: string) {
             const title = state.title;
             const input = state.input ?? {};
             const label = title || formatToolInput(part.tool, input);
-            // Remember the parent's most-recent Task callID so child-session events
-            // can attach to it via parent_tool_use_id.
-            if (!isChildEvent && part.tool === "task" && part.callID) {
-              store.lastTaskToolUseId = part.callID;
+            // A `task` part names its child session in metadata: that is the
+            // real link (no guessing from "last task seen").
+            if (!isChildEvent && part.tool === "task") {
+              if (part.callID) store.lastTaskToolUseId = part.callID;
+              trackTaskSubagent(store, part);
             }
             emitEvent(store, "tool_use", {
               tool_name: part.tool,

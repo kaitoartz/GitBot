@@ -150,6 +150,8 @@ A session is one running (or finished) agent conversation, held in the server's 
 
 `status` is also a reconciliation point for OpenCode: if the store still says `streaming: true` but `session.status` on the OpenCode server reports the session idle (a lost `session.idle` on the single, non-replayable event stream), the turn is finalized on the spot — `usage` and `done` are emitted to any connected stream and `streaming` comes back `false`. Turns younger than 5 s and turns waiting on an approval are never reconciled.
 
+Subagents in history: a `task` `tool_use` block carries `tool_use_id` plus `subagent: { childSessionId, agent, title, status }`. Its transcript is that child session's own history: `GET /sessions/<childSessionId>/history?agent=opencode&repoPath=<path>`.
+
 ## Event streams
 
 | Method | Path | Description |
@@ -165,14 +167,15 @@ Events carry a `seq` field and an SSE `id:`, so a client that reconnects with `L
 |---|---|---|
 | `user_prompt` | `prompt`, `attachments?` | The prompt that started the turn |
 | `system` | `subtype`, `data` or `session_id` | Agent session initialised |
-| `assistant` | `content` | Assistant text |
-| `tool_use` | `tool_name`, `tool_input` | The agent is calling a tool |
+| `assistant` | `content`, `parent_tool_use_id?` | Assistant text. On a subagent it carries `parent_tool_use_id` (the parent `task` callID) |
+| `tool_use` | `tool_name`, `tool_input`, `tool_use_id?`, `parent_tool_use_id?` | The agent is calling a tool. Subagent calls carry `parent_tool_use_id` |
+| `subagent` | `phase`, `parentToolUseId`, `childSessionId`, `agent?`, `title?`, `status` | A `task` spawned a child session (`started`), it finished (`finished`) or failed (`error`). OpenCode names the child in the task part's metadata, so the link is exact |
 | `tool_result` | `tool_use_id`, `tool_name`, `output`, `exit_code`, `status` | A command finished (Codex) |
 | `status` | `status`, `tool_name?`, `summary?` | Activity: `thinking`, `tool`, `tool_summary` |
 | `permission_request` | `toolUseID`, `toolName`, `input` | The agent needs approval (Claude Code, OpenCode — Codex never asks; its permission mode selects a sandbox) |
 | `result` | `subtype`, `cost`, `duration_ms`, `num_turns` | Turn statistics (Claude Code) |
 | `agent_error` | `message` | The agent itself reported a problem — provider refused, bad model (OpenCode); a connection retry or transport fallback (Codex). Not terminal on its own: it is followed by a terminal event only if the turn actually fails |
-| `usage` | `scope`, `usage`, `messageID?`, `context?`, `model?` | Token/cost accounting (OpenCode only). `scope: "turn"` rides along after a real assistant snapshot (`messageID` names its message); `scope: "session"` lands once at turn end with the cumulative total and the resolved context window. See [Usage](#usage) |
+| `usage` | `scope`, `usage`, `messageID?`, `context?`, `model?`, `parent_tool_use_id?` | Token/cost accounting (OpenCode only). `scope: "turn"` rides along after a real assistant snapshot (`messageID` names its message); `scope: "session"` lands once at turn end with the cumulative total and the resolved context window. A subagent's report carries `parent_tool_use_id`; its tokens count toward the turn total but never toward the parent's context window. See [Usage](#usage) |
 | `done` | — | Turn finished |
 | `aborted` | `message` | Turn was stopped |
 | `error` | `message` | Turn failed |

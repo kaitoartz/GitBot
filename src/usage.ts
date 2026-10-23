@@ -176,7 +176,12 @@ export function buildTurnReport(
 }
 
 /** Accumulate a live turn delta under a gitbot session id. */
-export function accumulateUsage(gitbotId: string, delta: UsageSnapshot, messageID?: string): void {
+export function accumulateUsage(
+  gitbotId: string,
+  delta: UsageSnapshot,
+  messageID?: string,
+  options: { updateWindow?: boolean } = {},
+): void {
   const current = liveTotals.get(gitbotId) ?? emptyUsage();
   if (messageID) {
     let ids = liveMessageIds.get(gitbotId);
@@ -191,8 +196,11 @@ export function accumulateUsage(gitbotId: string, delta: UsageSnapshot, messageI
   current.cost += delta.cost;
   current.total += delta.total;
   liveTotals.set(gitbotId, current);
-  // The window reflects the newest message, not the sum of all turns.
-  lastWindowUsed.set(gitbotId, delta.input + delta.cacheRead + delta.cacheWrite);
+  // The window reflects the newest message, not the sum of all turns. A
+  // subagent's message does not fill the parent's window, so it opts out.
+  if (options.updateWindow !== false) {
+    lastWindowUsed.set(gitbotId, delta.input + delta.cacheRead + delta.cacheWrite);
+  }
 }
 
 /** Context footprint of the newest counted message for a gitbot session. */

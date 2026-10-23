@@ -4461,3 +4461,152 @@ button.file-chip:hover {
   .theme-btn, .user-chip, .bot-profile-btn, .act-row, .queue-icon-btn, .queue-steer) {
   transition: var(--transition-control);
 }
+
+/* --- Subagents (Fase 3) -------------------------------------------------- */
+.subagent-card {
+  margin: 10px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.subagent-card.error { border-color: color-mix(in srgb, var(--danger, #d9534f) 55%, var(--line)); }
+.subagent-card.running { border-style: dashed; }
+.subagent-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.subagent-head:hover { background: var(--surface-3, var(--surface-2)); }
+.subagent-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted) 20%, transparent);
+}
+.subagent-card.running .subagent-dot {
+  background: var(--accent, #4c9aff);
+  animation: subagent-pulse 1.4s ease-in-out infinite;
+}
+.subagent-card.error .subagent-dot { background: var(--danger, #d9534f); }
+.subagent-card.finished .subagent-dot { background: var(--success, #3fb950); }
+.subagent-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.subagent-agent,
+.subagent-status {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-1, var(--surface));
+  color: var(--muted);
+  font-size: 11px;
+}
+.subagent-status { margin-left: auto; }
+.subagent-card.error .subagent-status { color: var(--danger, #d9534f); }
+.subagent-body {
+  padding: 0 10px 10px;
+  border-top: 1px solid var(--line);
+}
+.subagent-text { margin: 8px 0; max-height: 220px; overflow: auto; font-size: var(--text-sm); }
+.subagent-text .md { margin: 6px 0; }
+.subagent-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--muted);
+}
+.subagent-tools li {
+  display: flex;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.subagent-tools b { flex: none; color: var(--text); font-weight: 500; }
+.subagent-tools span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  opacity: 0.8;
+}
+.subagent-more { margin: 2px 0 6px; font-size: 11px; color: var(--muted); }
+.subagent-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.subagent-link {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.subagent-link:hover { background: var(--surface-3, var(--surface-2)); }
+
+.subagent-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: min(460px, 92vw);
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: -18px 0 40px rgba(0, 0, 0, 0.18);
+  animation: subagent-panel-in 200ms var(--ease-out);
+}
+.subagent-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-sm);
+}
+.subagent-panel-body {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 14px 24px;
+  font-size: var(--text-sm);
+}
+.subagent-msg { margin-bottom: 14px; }
+.subagent-msg.user { opacity: 0.75; }
+@keyframes subagent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes subagent-panel-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .subagent-card.running .subagent-dot { animation: none; }
+  .subagent-panel { animation: none; }
+}

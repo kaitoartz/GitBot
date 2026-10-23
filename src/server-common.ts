@@ -221,6 +221,15 @@ export function shouldAutoApprove(
   return false;
 }
 
+/** One live subagent: the `task` tool call that spawned it and its state. */
+export interface SessionSubagent {
+  parentToolUseId: string;
+  childSessionId: string;
+  agent?: string;
+  title?: string;
+  status: "running" | "completed" | "error";
+}
+
 export interface SessionStore {
   gitbotId: string;
   sdkSessionId: string | null;
@@ -246,10 +255,13 @@ export interface SessionStore {
   pendingAttachments?: import("./attachments").PendingAttachment[];
   /** When the current turn started; used to reconcile a lost terminal event. */
   turnStartedAt?: number;
+  /** Live subagents of this turn, keyed by the parent `task` call id. */
+  subagents?: Map<string, SessionSubagent>;
+  /** Child opencode session id → parent `task` call id. */
+  childToParentTool?: Map<string, string>;
 }
 
-/** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */
-export interface BotPreset {
+/** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */export interface BotPreset {
   id: string;
   name: string;
   instructions: string;

@@ -210,8 +210,15 @@ export function botSetupAction(id: string, action: "complete" | "reset" | "fail"
   );
 }
 
-export function getSessionStatus(sessionId: string) {
-  return req<{ streaming: boolean; sdkSessionId: string | null }>(
+/** Transcript of any OpenCode session, including a subagent's child session. */
+export function getSessionHistory(sessionId: string, repoPath?: string) {
+  const qs = new URLSearchParams({ agent: "opencode", ...(repoPath ? { repoPath } : {}) });
+  return req<{ messages: import("./gitbot").HistoryMsg[] }>(
+    `/sessions/${encodeURIComponent(sessionId)}/history?${qs.toString()}`,
+  );
+}
+
+export function getSessionStatus(sessionId: string) {  return req<{ streaming: boolean; sdkSessionId: string | null }>(
     `/sessions/${encodeURIComponent(sessionId)}/status`,
   );
 }

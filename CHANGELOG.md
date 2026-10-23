@@ -58,10 +58,25 @@ Cambios de este fork sobre `gitbot-hq/GitBot` 0.0.9. El upstream no se toca: `ma
 
 - **Thinking infinito tras responder (R7).** El turno nunca recibía `done` cuando se perdía `session.idle` en el stream global de eventos (no hay replay). Ahora `GET /sessions/:id/status` reconcilia contra `session.status` de OpenCode: si el server dice idle, cierra el turno (`usage` + `done`) al instante. La UI además sondea ese endpoint cada 4 s mientras cree que hay un turno vivo. Nunca reconcilia turnos de menos de 5 s ni turnos esperando aprobación.
 
+### Fase 3 - Subagentes en vivo
+
+**Agregado**
+
+- `src/start-opencode.ts`: vínculo exacto `task` → sesión hija usando `state.metadata.sessionId` (S3). Evento SSE `subagent` con `started` / `finished` / `error`, agente y título. `assistant`, `tool_use` y `usage` de hijos llevan `parent_tool_use_id` real.
+- Uso del hijo: suma al total del turno, no a la ventana de contexto del padre. El evento `usage` del hijo lleva `parent_tool_use_id`.
+- Historial: el `tool_use` de un `task` incluye `tool_use_id` y `subagent { childSessionId, agent, title, status }`; el transcript se lee por `GET /sessions/:child/history`.
+- UI: tarjeta colapsable por subagente (estado con color, texto y tools en vivo, costo/tokens) y panel lateral "View transcript". En hilos reabiertos las tarjetas salen del historial.
+- `scripts/smoke-subagents.mjs` (10 checks).
+
+**Notas**
+
+- Nada nuevo se persiste: todo se reconstruye desde OpenCode.
+- `ReasoningPart` plegable quedó fuera de alcance (opcional del plan).
+
 ### Pendiente
 
 - Aceptación manual de la barra de uso en el navegador (colores, conectividad en vivo).
 - Aceptación manual de Fase 2 en el navegador (clip, drag-drop, `@`).
-- Fase 3: subagentes en vivo.
+- Aceptación manual de Fase 3 en el navegador (dos tarjetas en vivo, subagente fallido en rojo, transcript).
 - Fase 4: variante de razonamiento por mensaje.
 - Fase 5 (opcional): orquestador que delega a otros bots.
