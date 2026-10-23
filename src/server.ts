@@ -26,7 +26,7 @@ import {
   type BotPreset,
 } from "./server-common";
 import { initAgent as initClaudeCode, runAgent as runClaudeCode, listSessions as listClaudeSessions, loadTranscript } from "./start-claude-code";
-import { initAgent as initOpencode, stopAgent as stopOpencode, runAgent as runOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission } from "./start-opencode";
+import { initAgent as initOpencode, stopAgent as stopOpencode, runAgent as runOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission, reconcileTurnStatus } from "./start-opencode";
 import { initAgent as initCodex, runAgent as runCodex, listSessions as listCodexSessions, loadTranscript as loadCodexTranscript } from "./start-codex";
 import { handleBotRoutes } from "./bot-routes";
 import { handleMarketplaceRoutes } from "./marketplace-proxy";
@@ -154,6 +154,12 @@ export async function handleRequest(
       const store = sessions.get(statusId)
         ?? [...sessions.values()].find(s => s.sdkSessionId === statusId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
+      // A lost `session.idle` would otherwise leave the client polling a turn
+      // that already answered. Reconcile lazily: this endpoint is exactly what
+      // the UI asks when it wants to know whether to keep spinning.
+      if (store.status === "running") {
+        await reconcileTurnStatus(store).catch(() => false);
+      }
       jsonOk(res, { streaming: store.status === "running", sdkSessionId: store.sdkSessionId ?? null });
       return;
     }

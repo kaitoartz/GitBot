@@ -68,6 +68,7 @@ Cuando el cambio está listo, `npm run build` desde la raíz para que quede en `
 ```bash
 npm run build:cli                            # el test del server lee dist/
 node --test scripts/attachments.test.mjs     # validación, MIME, FilePart
+node --test scripts/reconcile-status.test.mjs # guardas del cierre de turno
 node --test ui/scripts/attachments.test.mjs  # @menciones y tipos
 
 # turno real contra un `gitbot start` aislado (data dir temporal, puerto 3100)

@@ -244,6 +244,8 @@ export interface SessionStore {
   // Attachments for the turn about to run. Kept off the SSE event (which
   // carries only metadata) so a multi-MB data URL never reaches every client.
   pendingAttachments?: import("./attachments").PendingAttachment[];
+  /** When the current turn started; used to reconcile a lost terminal event. */
+  turnStartedAt?: number;
 }
 
 /** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */

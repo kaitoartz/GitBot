@@ -148,6 +148,8 @@ A session is one running (or finished) agent conversation, held in the server's 
 
 `:id` is the `sessionId` from `/chat`. `config`, `status`, `permissions`, `abort` and `/events` also accept the agent's own session id (`sdkSessionId`), which is what a thread stores; answering an approval and `PATCH` need the `sessionId`.
 
+`status` is also a reconciliation point for OpenCode: if the store still says `streaming: true` but `session.status` on the OpenCode server reports the session idle (a lost `session.idle` on the single, non-replayable event stream), the turn is finalized on the spot — `usage` and `done` are emitted to any connected stream and `streaming` comes back `false`. Turns younger than 5 s and turns waiting on an approval are never reconciled.
+
 ## Event streams
 
 | Method | Path | Description |

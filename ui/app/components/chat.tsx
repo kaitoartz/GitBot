@@ -862,6 +862,26 @@ export default function Chat({
     onActivityChange?.(streaming ? activity : null);
   }, [streaming, activity, onActivityChange]);
 
+  // Watchdog: a `done` can go missing (OpenCode closed the turn without the
+  // idle event GitBot waits for), leaving "Thinking…" spinning next to a reply
+  // that already arrived. The server's store is the source of truth, so ask it
+  // and settle locally when it says the turn is over.
+  useEffect(() => {
+    if (!streaming) return;
+    const timer = window.setInterval(() => {
+      const sid = sessionRef.current;
+      if (!sid) return;
+      getSessionStatus(sid)
+        .then(({ streaming: live }) => {
+          if (live || sessionRef.current !== sid) return;
+          finish(true);
+        })
+        .catch(() => {});
+    }, 4000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming]);
+
   // Tab alerts: badged favicon + standout title while hidden.
   // Unverdict permission requests outrank everything — the bot is
   // waiting on the user.

@@ -335,7 +335,7 @@ Vuelca cada evento crudo a `.spike-opencode/events-<timestamp>.jsonl` (ignorado 
 | R4 | `npm link` deja el `gitbot` global apuntando al clone roto | alto (día a día) | `npm run check` antes de build; `git stash`/`checkout` para volver; reinstalar global como plan B |
 | R5 | Cambios en `threads.json` rompen hilos existentes | medio | Campos opcionales + backup en Fase 0 + lectura tolerante |
 | R6 | UI sin store: props cada vez más profundas | bajo-medio | Componentes nuevos con props explícitas; no introducir context global salvo que duela |
-| R7 | **Bug abierto:** el indicador `Thinking…` no se apaga aunque el agente ya respondió | medio: la UI miente sobre el estado del turno | Reproducir con el SSE a la vista y confirmar si falta `session.idle` o llega un `status:"thinking"` tardío; recién entonces tocar `src/start-opencode.ts`. No bloquea Fase 2 |
+| R7 | Indicador `Thinking…` que seguía animando después de la respuesta (se perdía `session.idle` en el stream global, sin replay) | medio: la UI mentía sobre el estado del turno | **Mitigado:** `GET /sessions/:id/status` reconcilia contra `session.status` de OpenCode y finaliza el turno; la UI sondea cada 4 s mientras cree que hay turno vivo. Guardas: >5 s de antigüedad y sin permisos pendientes. Pendiente de aceptación manual |
 
 ---
 

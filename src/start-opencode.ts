@@ -259,6 +259,9 @@ export async function runAgent(store: SessionStore): Promise<void> {
   // Consume the bytes now: they are either attached to this turn or dropped by
   // a failure below. A long-lived session map must not retain megabytes.
   store.pendingAttachments = undefined;
+  // Reconciliation (`/sessions/:id/status`) refuses to settle a turn that is
+  // still ramping up; this is the clock it reads.
+  store.turnStartedAt = Date.now();
   (store as any)._msgRoles = new Map<string, string>();
   store.lastTaskToolUseId = undefined;
 
@@ -500,6 +503,69 @@ function findStoreByOpencodeSdkId(sdkId: string): SessionStore | undefined {
   return sessions.get(gitbotId);
 }
 
+/**
+ * Close a running turn: usage, setup verdict, status, terminal event, cleanup.
+ * Shared by the event stream (`session.idle`) and the reconciliation below so
+ * both paths end a turn identically.
+ */
+function finalizeTurn(store: SessionStore): void {
+  if (store.status === "done") return;
+  // Emit final session usage report with context window
+  let providerID: string | undefined;
+  let modelID: string | undefined;
+  if (store.model) {
+    const slashIdx = store.model.indexOf("/");
+    if (slashIdx !== -1) {
+      providerID = store.model.slice(0, slashIdx);
+      modelID = store.model.slice(slashIdx + 1);
+    }
+  }
+  const sessionReport = buildSessionReport(
+    store, providerID, modelID,
+    store.threadId ? `thread:${store.threadId}` : undefined,
+  );
+  emitEvent(store, "usage", sessionReport);
+  recordSetupOutcomeFromEvents(store);
+  store.status = "done";
+  store.turnStartedAt = undefined;
+  store.pendingPermissions.clear();
+  notifyPermissionsChanged();
+  emitEvent(store, "done", {});
+  scheduleCleanup(store);
+}
+
+/** A turn younger than this may still be starting; never reconcile it away. */
+const RECONCILE_MIN_AGE_MS = 5000;
+
+/** Guards for reconciliation, exported so the rules are unit-testable. */
+export function shouldReconcileTurn(store: SessionStore, now = Date.now()): boolean {
+  if (store.agent !== "opencode" || store.status !== "running" || !store.sdkSessionId) return false;
+  if (store.pendingPermissions.size > 0) return false;
+  return !!store.turnStartedAt && now - store.turnStartedAt >= RECONCILE_MIN_AGE_MS;
+}
+
+/**
+ * Reconcile a store that still says "running" against OpenCode itself.
+ *
+ * `session.idle` travels over a single global event stream with no replay: if
+ * that stream hiccups, the reply lands in the UI but the terminal event never
+ * does, and the thread spins "Thinking…" forever. `/sessions/:id/status` calls
+ * this so a poll can settle the turn; returns true when it just did.
+ */
+export async function reconcileTurnStatus(store: SessionStore): Promise<boolean> {
+  if (!shouldReconcileTurn(store)) return false;
+
+  const client = await getClientForDir(store.repoPath);
+  const result = await client.session.status();
+  // The map holds active sessions only: an absent id means the session is not
+  // busy. `type` is "busy" | "retry" | "idle" on 1.19.x.
+  const status = (result?.data ?? {})[store.sdkSessionId!];
+  if (status && status.type !== "idle") return false;
+
+  finalizeTurn(store);
+  return true;
+}
+
 // Walk session.parentID via the SDK until we land on a session we own (root) or run out.
 // Returns the root gitbot store and caches the mapping. Used to route subagent events
 // to the parent thread.
@@ -687,28 +753,7 @@ async function startEventStream(client: any, directory: string) {
       }
 
       if (type === "session.idle" || (type === "session.status" && props?.status?.type === "idle")) {
-        if (store.status === "done") continue;
-        // Emit final session usage report with context window
-        let providerID: string | undefined;
-        let modelID: string | undefined;
-        if (store.model) {
-          const slashIdx = store.model.indexOf("/");
-          if (slashIdx !== -1) {
-            providerID = store.model.slice(0, slashIdx);
-            modelID = store.model.slice(slashIdx + 1);
-          }
-        }
-        const sessionReport = buildSessionReport(
-          store, providerID, modelID,
-          store.threadId ? `thread:${store.threadId}` : undefined,
-        );
-        emitEvent(store, "usage", sessionReport);
-        recordSetupOutcomeFromEvents(store);
-        store.status = "done";
-        store.pendingPermissions.clear();
-        notifyPermissionsChanged();
-        emitEvent(store, "done", {});
-        scheduleCleanup(store);
+        finalizeTurn(store);
       }
     }
   } catch (err: any) {

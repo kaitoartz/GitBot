@@ -54,9 +54,9 @@ Cambios de este fork sobre `gitbot-hq/GitBot` 0.0.9. El upstream no se toca: `ma
 - El evento `user_prompt` lleva metadatos, nunca los bytes: los adjuntos viven en memoria del store durante el turno.
 - Con un turno corriendo, adjuntar pide esperar: la cola sigue siendo solo texto y no debe perder archivos en silencio.
 
-### Bugs conocidos
+### Corregido
 
-- **Thinking infinito tras responder.** En uso real el agente ya mostró su respuesta y la UI sigue con el indicador `Thinking…` animando. Sospecha: el turno no recibe/cierra su `done` (¿falta `session.idle` para esa sesión, o llega un `status:"thinking"` tardío?). No se pudo capturar el SSE concreto (los intentos de diagnóstico se interrumpieron). No bloquea Fase 2; hay que reproducirlo con la pestaña Network abierta antes de tocar `start-opencode.ts`.
+- **Thinking infinito tras responder (R7).** El turno nunca recibía `done` cuando se perdía `session.idle` en el stream global de eventos (no hay replay). Ahora `GET /sessions/:id/status` reconcilia contra `session.status` de OpenCode: si el server dice idle, cierra el turno (`usage` + `done`) al instante. La UI además sondea ese endpoint cada 4 s mientras cree que hay un turno vivo. Nunca reconcilia turnos de menos de 5 s ni turnos esperando aprobación.
 
 ### Pendiente
 
