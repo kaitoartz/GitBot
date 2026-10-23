@@ -1,4 +1,5 @@
-import { execSync } from "child_process";
+import { execSync, spawn, type ChildProcess } from "child_process";
+import { readFileSync } from "fs";
 import { basename } from "path";
 import { bindSession } from "./bot-store";
 import { presetSystemPrompt, recordSetupOutcomeFromEvents } from "./bot-prompt";
@@ -29,13 +30,15 @@ const resolveInflight = new Map<string, Promise<SessionStore | undefined>>();
 
 let sdkLoaded: any = null;
 
-// Where the SDK's createOpencode starts its server.
-const OPENCODE_URL = "http://127.0.0.1:4096";
+// Where the SDK's client looks for the server.
+const OPENCODE_URL = process.env.GITBOT_OPENCODE_URL ?? "http://127.0.0.1:4096";
+// The port gitbot spawns on, taken from that URL.
+const OPENCODE_PORT = new URL(OPENCODE_URL).port || "4096";
 
-// The server createOpencode spawned. It is not detached, but it outlives gitbot
+// The server gitbot spawned. It is not detached, but it outlives gitbot
 // whenever gitbot exits without passing on a signal, and every later start then
 // finds the port taken — so gitbot stops it on the way out.
-let spawnedServer: { close(): void } | null = null;
+let spawnedServer: ChildProcess | null = null;
 
 const permissionConfig = {
   edit: "ask",
@@ -75,16 +78,43 @@ export async function initAgent(): Promise<boolean> {
     return true;
   }
 
+  // GitBot speaks the v1 HTTP API (@opencode-ai/sdk 1.2.15). opencode 2.x
+  // serves a different, password-protected /api and cannot be used here, so the
+  // server is spawned from a 1.x binary we resolve ourselves instead of through
+  // the SDK (which runs a bare `opencode`, unusable on Windows where it is a
+  // .cmd shim, and would now pick up 2.x).
+  const bin = resolveOpencodeBin();
+  if (!bin) {
+    console.warn(
+      "  opencode: no 1.x binary found (GitBot speaks the v1 API; opencode 2.x is not compatible). " +
+        "Start `opencode serve --port 4096` yourself or set GITBOT_OPENCODE_BIN to a 1.x opencode binary.",
+    );
+    return true;
+  }
+
   try {
-    const result = await loaded.createOpencode({ config: { permission: permissionConfig } });
-    spawnedServer = result.server;
-    // Seed the default client (no directory) from the spawned server's client
-    clientsByDir.set("", result.client);
-    console.log("  opencode: ready");
+    const proc = spawn(bin.bin, ["serve", "--hostname=127.0.0.1", `--port=${OPENCODE_PORT}`], {
+      env: {
+        ...process.env,
+        // The SDK's own launcher passes the permission config this way.
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: permissionConfig }),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    spawnedServer = proc;
+    let output = "";
+    proc.stdout?.on("data", (chunk) => { output += String(chunk); });
+    proc.stderr?.on("data", (chunk) => { output += String(chunk); });
+    proc.on("exit", () => { if (spawnedServer === proc) spawnedServer = null; });
+
+    if (!(await waitForServer(15000))) {
+      throw new Error(output.trim().split("\n")[0] || "did not start in time");
+    }
+    // Seed the default client (no directory) from the spawned server.
+    clientsByDir.set("", loaded.createOpencodeClient({ baseUrl: OPENCODE_URL }));
+    console.log(`  opencode: ready (${bin.version})`);
   } catch (err: any) {
-    // Not fatal, and deliberately not `return false`: getClientForDir retries
-    // the port on every turn, so a server started later still gets used.
-    // Only the first line: the rest is opencode's own startup output.
     const reason = String(err?.message ?? err).split("\n")[0];
     console.warn(`  opencode: could not start a server on ${OPENCODE_URL} (${reason}) — opencode turns will fail until one is running`);
   }
@@ -92,9 +122,62 @@ export async function initAgent(): Promise<boolean> {
   return true;
 }
 
+/**
+ * The 1.x binary to spawn. Bare `opencode` is not used directly: on Windows it
+ * is a .cmd shim node cannot spawn, and its target may be 2.x.
+ */
+function resolveOpencodeBin(): { bin: string; version: string } | null {
+  const candidates: string[] = [];
+  if (process.env.GITBOT_OPENCODE_BIN) candidates.push(process.env.GITBOT_OPENCODE_BIN);
+  try {
+    const find = process.platform === "win32" ? "where opencode" : "which -a opencode";
+    const found = execSync(find, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of found.split(/\r?\n/)) {
+      const path = line.trim();
+      if (!path) continue;
+      candidates.push(path);
+      // Windows shims are wrappers; the real binary is quoted inside.
+      if (path.toLowerCase().endsWith(".cmd")) {
+        try {
+          const target = readFileSync(path, "utf8").match(/"([^"]+\.exe)"/);
+          if (target) candidates.push(target[1]);
+        } catch {}
+      }
+    }
+  } catch {}
+
+  for (const bin of candidates) {
+    const version = opencodeVersionOf(bin);
+    // 1.x only: 2.x is a different API. "" means the binary answers without a version.
+    if (version && /^v?1\./.test(version)) return { bin, version };
+  }
+  return null;
+}
+
+function opencodeVersionOf(bin: string): string | null {
+  try {
+    return execSync(`"${bin}" --version`, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Resolves once the server answers its health check, false on timeout. */
+async function waitForServer(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await runningServerVersion()) !== null) return true;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
 /** Stops the opencode server this gitbot started, if it started one. */
 export function stopAgent(): void {
-  spawnedServer?.close();
+  spawnedServer?.kill();
   spawnedServer = null;
 }
 
