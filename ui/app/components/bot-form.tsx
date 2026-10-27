@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { IconQuestionMark } from "@tabler/icons-react";
+import { IconQuestionMark, IconPlus, IconSettings } from "@tabler/icons-react";
 import { PanelBack, CloseButton } from "./panel-controls";
-import { createBot, deleteBot, getAgents, patchBot, type BotInput } from "../lib/api";
+import { createBot, deleteBot, getAgents, getRoutingGroups, patchBot, type BotInput, type RoutingGroup } from "../lib/api";
+import RoutingGroupEditor from "./routing-group-editor";
 import type { Bot } from "../lib/gitbot";
 import { getAvatarPref, resolveAvatar, defaultMascotFor, type AvatarMascot, type AvatarPref } from "../lib/avatar-prefs";
 import { bodies } from "./bot-maker/registry";
@@ -104,6 +105,9 @@ export default function BotForm({
   const [setupInstructions, setSetupInstructions] = useState(bot ? bot.setupInstructions || "" : "");
   const [repoPath, setRepoPath] = useState(bot ? bot.repoPath || "" : "");
   const [model, setModel] = useState(bot ? bot.model || "" : "");
+  const [tab, setTab] = useState<"general" | "model" | "advanced">("general");
+  const [groups, setGroups] = useState<RoutingGroup[]>([]);
+  const [groupEditor, setGroupEditor] = useState<{ group: RoutingGroup | null } | null>(null);
   // New bots ask first: auto-approve is opt-in, never the default a
   // freshly imported or created bot runs tools with.
   const [permissionMode, setPermissionMode] = useState(
@@ -148,6 +152,19 @@ export default function BotForm({
   }, [bot?.id]);
 
   const agentMissing = installed !== null && !installed.includes(agent);
+
+  useEffect(() => {
+    let alive = true;
+    getRoutingGroups().then(
+      ({ groups: list }) => { if (alive) setGroups(list); },
+      () => { if (alive) setGroups([]); },
+    );
+    return () => { alive = false; };
+  }, []);
+
+  const selectedGroupId = model.startsWith("group:") ? model.slice("group:".length) : null;
+  const selectedGroup = selectedGroupId ? groups.find((g) => g.id === selectedGroupId) : undefined;
+  const modelMode = selectedGroupId ? "group" : model.trim() ? "custom" : "";
 
   function isDirty(): boolean {
     const s = initial.current;
@@ -379,6 +396,26 @@ export default function BotForm({
           </div>
         </div>
         <div className="studio-main">
+        <div className="form-tabs" role="tablist" aria-label="Bot settings">
+          {([
+            ["general", "General"],
+            ["model", "Model"],
+            ["advanced", "Advanced"],
+          ] as const).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={tab === id}
+              className={tab === id ? "form-tab selected" : "form-tab"}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {tab === "general" && (
+          <>
         <Field label="Name">
           <input
             value={name}
@@ -425,6 +462,98 @@ export default function BotForm({
               placeholder="You keep documentation in sync with the code. On each run, read the latest commit and update the docs it affects."
             />
           </Field>
+          </>
+        )}
+        {tab === "model" && (
+          <>
+          <Field label="Model" tip="a single model or a routing group that fails over">
+            <div className="model-picker">
+              <select
+                value={modelMode === "group" ? model : modelMode === "custom" ? "__custom" : ""}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (value === "__custom") setModel("");
+                  else if (value === "") setModel("");
+                  else setModel(value);
+                }}
+                aria-label="Model source"
+              >
+                <option value="">Agent default</option>
+                {groups.length > 0 && (
+                  <optgroup label="Routing groups">
+                    {groups.map((group) => (
+                      <option key={group.id} value={`group:${group.id}`}>
+                        {group.name} · {group.models.length} model{group.models.length === 1 ? "" : "s"}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                <option value="__custom">Single model…</option>
+              </select>
+              {modelMode === "group" && selectedGroup && (
+                <>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setGroupEditor({ group: selectedGroup })}
+                  >
+                    <IconSettings size={15} /> Edit group
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => setGroupEditor({ group: null })}
+                  >
+                    <IconPlus size={15} /> New
+                  </button>
+                </>
+              )}
+            </div>
+            {modelMode === "group" && selectedGroup ? (
+              <div className="routing-summary">
+                <ol>
+                  {selectedGroup.models.map((ref, index) => (
+                    <li key={ref}>
+                      <span>{index + 1}</span>
+                      <code>{ref}</code>
+                      {selectedGroup.dailyTokenBudgets?.[ref] ? (
+                        <small>{selectedGroup.dailyTokenBudgets[ref].toLocaleString()} tok/day</small>
+                      ) : null}
+                    </li>
+                  ))}
+                </ol>
+                <small>
+                  First entry is active. On quota, daily limit, provider failure or an unknown model,
+                  the next one answers.
+                </small>
+              </div>
+            ) : (
+              <>
+                <input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="magpie/auto/glm-5.3-flash-free"
+                  aria-label="Single model"
+                />
+                <div className="model-picker-actions">
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => setGroupEditor({ group: null })}
+                  >
+                    <IconPlus size={15} /> New routing group
+                  </button>
+                  {groups.length === 0 && (
+                    <small className="field-warn">No groups yet.</small>
+                  )}
+                </div>
+              </>
+            )}
+          </Field>
+          </>
+        )}
+        {tab === "advanced" && (
+          <>
           <Field label="Permissions">
             <select value={permissionMode} onChange={(e) => setPermissionMode(e.target.value)}>
               {agent === "codex" ? (
@@ -462,13 +591,6 @@ export default function BotForm({
               placeholder="blank uses the server's directory"
             />
           </Field>
-          <Field label="Model" tip="optional">
-            <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="claude-sonnet-4-6"
-            />
-          </Field>
           <Field label="Allowed tools" tip="comma-separated; blank means all">
             <input
               value={allowedTools}
@@ -482,6 +604,8 @@ export default function BotForm({
               </small>
             )}
           </Field>
+          </>
+        )}
           {error && <p className="chat-error">{error}</p>}
           <div className="acts">
             {editing && bot && (
@@ -510,6 +634,27 @@ export default function BotForm({
         </div>
       </div>
     </div>
+    {groupEditor && (
+      <RoutingGroupEditor
+        group={groupEditor.group}
+        onClose={() => setGroupEditor(null)}
+        onSaved={(group) => {
+          setGroups((prev) => {
+            const next = prev.some((g) => g.id === group.id)
+              ? prev.map((g) => (g.id === group.id ? group : g))
+              : [...prev, group];
+            return next.sort((a, b) => a.name.localeCompare(b.name));
+          });
+          setModel(`group:${group.id}`);
+          setGroupEditor(null);
+        }}
+        onDeleted={(id) => {
+          setGroups((prev) => prev.filter((g) => g.id !== id));
+          if (selectedGroupId === id) setModel("");
+          setGroupEditor(null);
+        }}
+      />
+    )}
     </>
   );
 }

@@ -1167,6 +1167,16 @@ pre {
   font-size: var(--text-sm);
 }
 
+.chat-notice {
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
 .chat-error button {
   background: none;
   border: 0;
@@ -3730,6 +3740,50 @@ button.file-chip:hover {
   margin-top: var(--space-2);
 }
 
+.bubble.user .user-acts {
+  justify-content: flex-end;
+  margin-top: var(--space-1);
+}
+
+.bubble.user .user-acts .icon-btn {
+  color: rgba(245, 245, 245, 0.68);
+}
+
+.bubble.user .user-acts .icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.bubble.user .edit-inline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.bubble.user .edit-inline textarea {
+  width: 100%;
+  background: transparent;
+  border: 1px solid rgba(245, 245, 245, 0.25);
+  border-radius: var(--radius-sm);
+  color: #f5f5f5;
+  padding: var(--space-2);
+  font: inherit;
+  line-height: inherit;
+  resize: vertical;
+}
+
+.bubble.user .edit-inline textarea:focus {
+  outline: none;
+  border-color: rgba(245, 245, 245, 0.6);
+}
+
+.edit-inline-acts {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
 .copy-reply-error {
   align-self: center;
   color: var(--danger);
@@ -4788,4 +4842,180 @@ button.file-chip:hover {
 @media (prefers-reduced-motion: reduce) {
   .subagent-card.running .subagent-dot { animation: none; }
   .subagent-panel { animation: none; }
+}
+
+/* --- Routing groups: bot form tabs, model picker, group editor ---------- */
+.form-tabs {
+  display: flex;
+  gap: var(--space-1);
+  margin-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.form-tab {
+  margin-bottom: -1px;
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.form-tab:hover { color: var(--text); }
+.form-tab.selected { color: var(--text); border-bottom-color: var(--text); }
+
+.model-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.model-picker select { flex: 1 1 240px; min-width: 0; }
+.model-picker .btn-secondary,
+.model-picker .btn-ghost { flex: none; }
+
+.model-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.routing-summary {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.routing-summary ol {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.routing-summary li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.routing-summary li > span { width: 16px; color: var(--muted); text-align: right; flex: none; }
+.routing-summary li code { min-width: 0; overflow-wrap: anywhere; }
+.routing-summary li small { margin-left: auto; color: var(--muted); flex: none; }
+
+.routing-summary > small {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+}
+
+.routing-backdrop { z-index: 80; }
+.routing-modal { max-width: 700px; }
+
+.routing-model-list { display: grid; gap: var(--space-2); }
+
+.routing-model-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 88px 28px 28px 28px;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.routing-model-order { color: var(--muted); font-size: var(--text-xs); text-align: right; }
+.routing-model-main { display: grid; gap: 2px; min-width: 0; }
+.routing-model-main code { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.routing-model-main small { color: var(--muted); font-size: var(--text-xs); }
+
+.routing-modal .field .routing-model-budget {
+  width: 100%;
+  padding: 5px 6px;
+  font-size: var(--text-xs);
+  text-align: right;
+}
+
+.routing-empty { margin: 0; color: var(--muted); font-size: var(--text-sm); }
+
+.routing-add {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-5);
+  padding: var(--space-4);
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+}
+
+.routing-add-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.routing-add-title span { color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+
+.routing-add-row { display: flex; align-items: center; gap: var(--space-2); }
+.routing-add-row input,
+.routing-add-row select {
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+.routing-add-row input { flex: 1 1 140px; }
+.routing-add-row select { flex: 1 1 200px; }
+.routing-add-row .btn-secondary { flex: none; }
+
+.routing-notice {
+  margin: var(--space-3) 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.composer-routing-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 4px 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.composer-routing-badge b { color: var(--text); font-weight: 600; }
+.composer-routing-model { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.composer-routing-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--accent); }
+
+@media (max-width: 620px) {
+  .routing-model-row { grid-template-columns: 18px minmax(0, 1fr) 28px 28px 28px; }
+  .routing-model-budget { grid-column: 2; width: 110px; }
+  .routing-add-row { flex-wrap: wrap; }
 }

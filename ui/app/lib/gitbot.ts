@@ -41,6 +41,8 @@ export type ThreadFull = Thread & {
   repoPath: string;
   preview: string;
   messageCount: number;
+  /** Active entry of a routing group; omitted for single-model bots. */
+  routing?: { groupId: string; index: number };
   createdAt: string;
   updatedAt: string;
 };
@@ -66,6 +68,8 @@ export type HistoryBlock = {
 };
 
 export type HistoryMsg = {
+  /** OpenCode message id, used to rewind to this user message. */
+  id?: string;
   role: string;
   content: HistoryBlock[];
 };

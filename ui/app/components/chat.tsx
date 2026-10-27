@@ -10,6 +10,7 @@ import { CircleStopIcon } from "@animateicons/react/lucide/circle-stop-icon";
 import { EllipsisIcon } from "@animateicons/react/lucide/ellipsis-icon";
 import { MessageSquarePlusIcon } from "@animateicons/react/lucide/message-square-plus-icon";
 import { RefreshCwIcon } from "@animateicons/react/lucide/refresh-cw-icon";
+import { HistoryIcon } from "@animateicons/react/lucide/history-icon";
 import { UserIcon } from "@animateicons/react/lucide/user-icon";
 import { ShieldCheckIcon } from "@animateicons/react/lucide/shield-check-icon";
 import { PencilIcon } from "@animateicons/react/lucide/pencil-icon";
@@ -32,6 +33,7 @@ import {
   getMessages,
   getModelCapabilities,
   getPendingPermissions,
+  getRoutingGroups,
   getSessionConfig,
   getSessionHistory,
   getSessionStatus,
@@ -39,6 +41,8 @@ import {
   postAbort,
   postChat,
   postPermission,
+  postRevert,
+  postUnrevert,
   listDir,
   browseEntries,
   searchFiles,
@@ -47,6 +51,7 @@ import {
   type ChatPermissionMode,
   type DirEntry,
   type ModelCapabilities,
+  type RoutingGroup,
 } from "../lib/api";
 import {
   applyMention,
@@ -143,6 +148,8 @@ type LiveSubagent = {
 };
 type Msg = {
   id: string;
+  /** OpenCode message id for a history user message; absent when live. */
+  sourceId?: string;
   role: "user" | "assistant";
   segs: Seg[];
   attachments?: FileChip[];
@@ -688,6 +695,7 @@ export default function Chat({
 }) {
   // An explicit thread choice wins over the bot's, matching the server.
   const agent = thread?.agent ?? botAgent ?? "claude-code";
+  const canRewind = !setup && agent === "opencode";
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -703,6 +711,9 @@ export default function Chat({
   } | null>(null);
   const [perms, setPerms] = useState<(PermRequest & { verdict?: boolean })[]>([]);
   const [turnError, setTurnError] = useState<string | null>(null);
+  /** Failover notices for this turn: model A failed, moved to B. Survives the
+   *  end-of-turn history swap so the reason stays visible until the next turn. */
+  const [notices, setNotices] = useState<string[]>([]);
   // Single "up next" slot: the server runs one turn per thread (a second
   // POST /chat mid-turn is a 409), so follow-ups sent while streaming wait
   // here and flush when the turn ends. One slot — a newer send replaces it.
@@ -732,7 +743,16 @@ export default function Chat({
   const [pathResults, setPathResults] = useState<{ path: string; name: string }[] | null>(null);
   const pathTimer = useRef<number | null>(null);
   const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
+  const [routingGroups, setRoutingGroups] = useState<RoutingGroup[]>([]);
+  const [routingIndex, setRoutingIndex] = useState(0);
   const [variant, setVariant] = useState<string | null>(null);
+  const [rewindBusy, setRewindBusy] = useState(false);
+  // Inline edit of a user message: the bubble becomes an input in place.
+  const [editing, setEditing] = useState<{ id: string; sourceId: string; text: string } | null>(null);
+  const editBoxRef = useRef<HTMLTextAreaElement | null>(null);
+  // A staged OpenCode revert is committed by the next prompt; if the user
+  // leaves the thread first, cancel it so history does not silently vanish.
+  const pendingRevert = useRef<{ threadId: string } | null>(null);
   const variantRef = useRef<string | null>(null);
   // "Restart this turn with <variant>": set from the reasoning menu while a
   // turn is running; the next finish() relaunches the same prompt.
@@ -831,6 +851,17 @@ export default function Chat({
   useEffect(() => {
     setActiveMenu(null);
   }, [thread?.id]);
+
+  // Focus the inline edit box the moment it appears.
+  useEffect(() => {
+    if (editing) {
+      const box = editBoxRef.current;
+      if (box) {
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      }
+    }
+  }, [editing?.id]);
 
   useEffect(() => {
     if (!streaming || activeMenu || setup) {
@@ -989,7 +1020,12 @@ export default function Chat({
         prev && prev.role === role
           ? prev
           : (() => {
-              const fresh: Msg = { id: `h${out.length}`, role, segs: [] };
+              const fresh: Msg = {
+                id: `h${out.length}`,
+                role,
+                segs: [],
+                ...(m.id ? { sourceId: m.id } : {}),
+              };
               out.push(fresh);
               return fresh;
             })();
@@ -1033,6 +1069,7 @@ export default function Chat({
     setLive(null);
     threadRef.current = thread?.id ?? null;
     setMsgs([]);
+    setEditing(null);
     setPerms([]);
     setTurnError(null);
     setActivity(null);
@@ -1096,6 +1133,11 @@ export default function Chat({
     return () => {
       closeStream();
       if (reloadTimer.current) clearTimeout(reloadTimer.current);
+      const staged = pendingRevert.current;
+      if (staged) {
+        pendingRevert.current = null;
+        postUnrevert(staged.threadId).catch(() => {});
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread?.id]);
@@ -1469,6 +1511,25 @@ export default function Chat({
       if (catchupRef.current) return;
       setTurnError(String(data(ev).message ?? "The agent reported an error"));
     });
+    // A routing group moved to its next model. Keep the reason on screen: the
+    // turn continues, so there is no error banner, and the failed model's
+    // message itself is an empty assistant turn that history drops.
+    es.addEventListener("agent_failover", (ev) => {
+      if (catchupRef.current) return;
+      const d = data(ev);
+      const from = String(d.from ?? "model");
+      const to = String(d.to ?? "next model");
+      const detail = String(d.detail || d.reason || "error");
+      if (typeof d.index === "number") setRoutingIndex(d.index);
+      setNotices((prev) => [...prev, `${from} falló: ${detail} → saltando a ${to}`]);
+    });
+    es.addEventListener("agent_failover_exhausted", (ev) => {
+      if (catchupRef.current) return;
+      const d = data(ev);
+      const name = String(d.name ?? d.group ?? "routing group");
+      const detail = String(d.detail || d.reason || "no models left");
+      setNotices((prev) => [...prev, `${name} agotado: ${detail}`]);
+    });
     es.addEventListener("aborted", () => {
       setMsgs((prev) => [
         ...prev,
@@ -1754,12 +1815,45 @@ export default function Chat({
     };
   }, [pathQuery, pathOpen, pathScope, thread?.id]);
 
+  // A routing group hides the real model behind "group:<id>". Resolve the
+  // active entry so the badge, capabilities and reasoning menu agree with what
+  // the server will actually call.
+  const routingGroupId = botModel?.startsWith("group:") ? botModel.slice("group:".length) : null;
+  const routingGroup = routingGroupId
+    ? routingGroups.find((group) => group.id === routingGroupId)
+    : undefined;
+  const safeRoutingIndex = routingGroup
+    ? Math.min(Math.max(0, routingIndex), routingGroup.models.length - 1)
+    : 0;
+  const activeModel = routingGroup ? routingGroup.models[safeRoutingIndex] : botModel;
+
+  useEffect(() => {
+    if (!routingGroupId) {
+      setRoutingGroups([]);
+      return;
+    }
+    let cancelled = false;
+    getRoutingGroups().then(
+      ({ groups }) => {
+        if (!cancelled) setRoutingGroups(groups);
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [routingGroupId]);
+
+  useEffect(() => {
+    setRoutingIndex(thread?.routing?.index ?? 0);
+  }, [thread?.id, thread?.routing?.index]);
+
   // The clip is only honest for OpenCode + a model that declares vision/PDF.
   useEffect(() => {
     setCapabilities(null);
-    if (agent !== "opencode" || !botModel) return;
+    if (agent !== "opencode" || !activeModel) return;
     let cancelled = false;
-    getModelCapabilities(botModel)
+    getModelCapabilities(activeModel)
       .then((caps) => {
         if (!cancelled) setCapabilities(caps);
       })
@@ -1767,7 +1861,7 @@ export default function Chat({
     return () => {
       cancelled = true;
     };
-  }, [agent, botModel]);
+  }, [agent, activeModel]);
 
   // Reasoning is per message: keep the ref in sync for the very next
   // startTurn, even before React re-renders.
@@ -1805,10 +1899,78 @@ export default function Chat({
     requestAnimationFrame(scrollDown);
   }
 
+  async function beginEdit(m: Msg) {
+    if (!thread || !m.sourceId || !canRewind || streaming || turnActiveRef.current || rewindBusy) return;
+    if (!window.confirm(
+      "Edit this message? It and everything after it will be replaced when you send. File changes made after it will also be rolled back.",
+    )) return;
+    setRewindBusy(true);
+    try {
+      await postRevert(thread.id, m.sourceId);
+      pendingRevert.current = { threadId: thread.id };
+      setEditing({ id: m.id, sourceId: m.sourceId, text: msgText(m) });
+    } catch (e) {
+      setTurnError(errText(e));
+    } finally {
+      setRewindBusy(false);
+    }
+  }
+
+  async function rewindTo(m: Msg) {
+    if (!thread || !m.sourceId || !canRewind || streaming || turnActiveRef.current || rewindBusy) return;
+    if (!window.confirm(
+      "Rewind to this message? It and everything after it will be removed when you send your next message. File changes made after it will also be rolled back.",
+    )) return;
+    setRewindBusy(true);
+    try {
+      await postRevert(thread.id, m.sourceId);
+      pendingRevert.current = { threadId: thread.id };
+      setMsgs((prev) => {
+        const index = prev.findIndex((x) => x.role === "user" && x.sourceId === m.sourceId);
+        return index >= 0 ? prev.slice(0, index) : prev;
+      });
+      stick.current = true;
+      requestAnimationFrame(() => {
+        scrollDown();
+        boxRef.current?.focus();
+      });
+    } catch (e) {
+      setTurnError(errText(e));
+    } finally {
+      setRewindBusy(false);
+    }
+  }
+
+  /** Cancel the inline edit and drop the staged revert. */
+  function cancelEdit() {
+    const target = editing;
+    setEditing(null);
+    if (target && pendingRevert.current?.threadId === thread?.id) {
+      pendingRevert.current = null;
+      if (thread) postUnrevert(thread.id).catch(() => {});
+    }
+  }
+
+  /** Commit the inline edit: cut the tail, then send the new text. */
+  async function sendEdit() {
+    if (!editing || !thread) return;
+    const text = editing.text;
+    const targetId = editing.id;
+    setEditing(null);
+    setMsgs((prev) => {
+      const index = prev.findIndex((x) => x.id === targetId);
+      return index >= 0 ? prev.slice(0, index) : prev;
+    });
+    await startTurn(text);
+  }
+
   async function startTurn(prompt: string, pending: PendingAttachment[] = []) {
     // No streaming check: callers own that (sendPrompt enqueues mid-turn,
     // maybeFlush only runs once the previous turn fully ended).
     if (!thread || (!prompt.trim() && pending.length === 0)) return;
+    // This prompt commits a staged rewind; the thread-switch cleanup must not
+    // cancel it after the fact.
+    if (pendingRevert.current?.threadId === thread.id) pendingRevert.current = null;
     lastPrompt.current = prompt;
     lastTurnAttachments.current = pending;
     catchupRef.current = false;
@@ -1820,6 +1982,7 @@ export default function Chat({
     setAttachError(null);
     if (threadRef.current) drafts.current[threadRef.current] = "";
     setTurnError(null);
+    setNotices([]);
     setPerms([]);
     subagentsRef.current = {};
     setSubagents({});
@@ -2186,10 +2349,39 @@ export default function Chat({
               className={`${m.role === "user" ? "bubble user" : "bubble assistant"}${m.id.startsWith("m") ? " msg-in" : ""}`}
             >
               {m.attachments?.length ? <MessageAttachments files={m.attachments} /> : null}
-              {m.segs.map((s, si) =>
-                s.kind === "text" ? (
-                  <RichText key={si} botColor={botAvatar?.color} text={setup && m.role === "assistant" ? presentSetupText(s.text) : s.text} />
-                ) : null,
+              {editing && editing.id === m.id ? (
+                <div className="edit-inline">
+                  <textarea
+                    ref={editBoxRef}
+                    value={editing.text}
+                    rows={Math.max(2, editing.text.split("\n").length)}
+                    onChange={(e) => setEditing({ ...editing, text: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        void sendEdit();
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        cancelEdit();
+                      }
+                    }}
+                    aria-label="Edit message"
+                  />
+                  <div className="edit-inline-acts">
+                    <button type="button" className="btn-primary btn-compact" onClick={() => void sendEdit()}>
+                      Send
+                    </button>
+                    <button type="button" className="btn-ghost btn-compact" onClick={cancelEdit}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                m.segs.map((s, si) =>
+                  s.kind === "text" ? (
+                    <RichText key={si} botColor={botAvatar?.color} text={setup && m.role === "assistant" ? presentSetupText(s.text) : s.text} />
+                  ) : null,
+                )
               )}
               {m.role === "assistant" &&
                 subagentsOf(m).map((t, i) => (
@@ -2238,6 +2430,30 @@ export default function Chat({
                       <AnimatedActionIcon icon={RefreshCwIcon} size={15} aria-hidden="true" />
                     </button>
                   )}
+                </span>
+              )}
+              {m.role === "user" && m.sourceId && canRewind && !streaming && editing?.id !== m.id && (
+                <span className="msg-acts user-acts">
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => void beginEdit(m)}
+                    disabled={rewindBusy}
+                    aria-label="Edit this message"
+                    data-tip="Edit & rewind"
+                  >
+                    <AnimatedActionIcon icon={PencilIcon} size={15} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => void rewindTo(m)}
+                    disabled={rewindBusy}
+                    aria-label="Rewind to this message"
+                    data-tip="Rewind to here"
+                  >
+                    <AnimatedActionIcon icon={HistoryIcon} size={15} aria-hidden="true" />
+                  </button>
                 </span>
               )}
             </article>
@@ -2346,15 +2562,20 @@ export default function Chat({
             </p>
           ),
         )}
+        {notices.map((notice, i) => (
+          <div key={`notice-${i}`} className="chat-notice">
+            ⚠ {notice}
+          </div>
+        ))}
         {turnError && (
-          <p className="chat-error">
-            {turnError}{" "}
+          <div className="chat-notice">
+            ⚠ {turnError}{" "}
             {lastPrompt.current && !streaming && (
               <button type="button" onClick={() => sendPrompt(lastPrompt.current)}>
                 Retry
               </button>
             )}
-          </p>
+          </div>
         )}
         {activity && (
           <div className="thinking-row" style={{ color: botAvatar?.color }}>
@@ -2719,6 +2940,20 @@ export default function Chat({
               aria-label={setup ? "Setup response" : "Message"}
             />
             <div className="composer-controls">
+            {routingGroup && (
+              <span
+                className="composer-routing-badge"
+                title={`${routingGroup.name} · ${activeModel}`}
+              >
+                <span className="composer-routing-dot" aria-hidden="true" />
+                <span className="composer-routing-model">
+                  {activeModel?.split("/").pop()}
+                </span>
+                <b>
+                  {safeRoutingIndex + 1}/{routingGroup.models.length}
+                </b>
+              </span>
+            )}
             <div className="composer-permissions">
               <button
                 ref={permissionButtonRef}
@@ -2797,7 +3032,11 @@ export default function Chat({
                   >
                     <div className="composer-permission-menu-title">
                       <span>Reasoning</span>
-                      <span className="composer-reasoning-model">{botModel?.split("/").pop()}</span>
+                      <span className="composer-reasoning-model">
+                        {routingGroup
+                          ? `${activeModel?.split("/").pop()} · ${safeRoutingIndex + 1}/${routingGroup.models.length}`
+                          : botModel?.split("/").pop()}
+                      </span>
                     </div>
                     {[null, ...capabilities.variants].map((level) => (
                       <button

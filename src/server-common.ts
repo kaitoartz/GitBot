@@ -310,6 +310,18 @@ export interface SessionStore {
   subagents?: Map<string, SessionSubagent>;
   /** Child opencode session id → parent `task` call id. */
   childToParentTool?: Map<string, string>;
+  /** Active entry of a routing group (`group:<id>`), if this session uses one. */
+  routing?: { groupId: string; index: number };
+  /** The provider/model actually in use, when it differs from `model` (a group ref). */
+  activeModel?: string;
+  /** Body pieces of the current turn, kept so a quota error can re-prompt on the next model. */
+  turnRequest?: { parts: any[]; variant?: string; mode?: string; system?: string; tools?: Record<string, boolean> };
+  /** True once the assistant produced text this turn: a late error must not re-prompt in that case. */
+  turnHadOutput?: boolean;
+  /** Guards against two terminal error events racing each other. */
+  failoverInFlight?: boolean;
+  /** Last cumulative token total seen per assistant message, for ledger deltas. */
+  ledgerTotals?: Map<string, number>;
 }
 
 /** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */

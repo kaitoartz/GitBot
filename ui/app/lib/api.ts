@@ -53,6 +53,21 @@ export function getMessages(threadId: string) {
   );
 }
 
+/** Stage an OpenCode rewind. The next prompt commits it. */
+export function postRevert(threadId: string, messageID: string) {
+  return req<{ ok: boolean }>(`/threads/${encodeURIComponent(threadId)}/revert`, {
+    method: "POST",
+    body: JSON.stringify({ messageID }),
+  });
+}
+
+/** Cancel a staged rewind before any prompt commits it. */
+export function postUnrevert(threadId: string) {
+  return req<{ ok: boolean }>(`/threads/${encodeURIComponent(threadId)}/unrevert`, {
+    method: "POST",
+  });
+}
+
 export function createThread(botId: string, repoPath?: string, agent?: string) {
   return req<{ thread: import("./gitbot").ThreadFull }>("/threads", {
     method: "POST",
@@ -157,6 +172,78 @@ export type ModelCapabilities = {
 export function getModelCapabilities(model: string) {
   return req<ModelCapabilities>(
     `/models/capabilities?model=${encodeURIComponent(model)}`,
+  );
+}
+
+export type CatalogModel = {
+  id: string;
+  /** Ready to store in a group: "provider/id". */
+  ref: string;
+};
+
+/** Live catalog straight from the provider (Magpie), not opencode.json. */
+export function getModelCatalog(provider = "magpie", q?: string) {
+  const qs = new URLSearchParams({ provider });
+  if (q) qs.set("q", q);
+  return req<{
+    provider: string;
+    models: CatalogModel[];
+    count: number;
+    source: "live" | "cache" | "unavailable";
+    error?: string;
+  }>(`/models/catalog?${qs.toString()}`);
+}
+
+export type RoutingGroup = {
+  id: string;
+  name: string;
+  models: string[];
+  onError?: "rotate" | "fail";
+  dailyTokenBudgets?: Record<string, number>;
+  matchers?: Record<string, string>;
+  shortRetryMinutes?: number;
+  createdAt?: string;
+  updatedAt?: string;
+  /** Only on GET /routing-groups: tokens spent today per model. */
+  spentToday?: Record<string, number>;
+};
+
+export type RoutingGroupInput = {
+  name: string;
+  models: string[];
+  onError?: "rotate" | "fail";
+  dailyTokenBudgets?: Record<string, number>;
+};
+
+export function getRoutingGroups() {
+  return req<{ groups: RoutingGroup[] }>("/routing-groups");
+}
+
+export function createRoutingGroup(body: RoutingGroupInput) {
+  return req<{ group: RoutingGroup }>("/routing-groups", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function patchRoutingGroup(id: string, body: Partial<RoutingGroupInput>) {
+  return req<{ group: RoutingGroup }>(
+    `/routing-groups/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+export function deleteRoutingGroup(id: string) {
+  return req<{ deleted: boolean }>(
+    `/routing-groups/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function resetRoutingGroup(id: string) {
+  return req<{ ok: boolean; group: string; models: number; threads: number }>(
+    `/routing-groups/${encodeURIComponent(id)}/reset`,
+    { method: "POST" },
   );
 }
 

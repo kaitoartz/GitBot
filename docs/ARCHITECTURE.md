@@ -80,6 +80,14 @@ All three agents get the same bot framing — the job prompt, the setup prompt a
 
 **Codex** (`codex`) uses `@openai/codex-sdk`, which runs the Codex binary bundled with it rather than the `codex` on your PATH; your own install supplies the login (`codex login`). If the bundled binary cannot be found, gitbot falls back to the `codex` on PATH and logs a warning, since the two versions may differ. Codex has no per-call approvals in gitbot, and cannot have them: `codex exec` has no channel to ask on and reports its approval policy as `never` whichever policy it is handed, so a permission mode picks a sandbox and nothing else — `ask-permissions` → `read-only`, `allow-all-edits` → `workspace-write`, `yolo` → `danger-full-access` — and plan mode forces `read-only`. A mode change applies from the next turn. Because a codex bot cannot be asked, a *bot* set to `ask-permissions` opens its codex threads in `allow-all-edits`; the alternative is a bot that can never act and never prompts. Read-only stays reachable per conversation from the chat composer. Bot tool lists are enforced by the Claude Code and OpenCode harnesses only — codex has no equivalent, so a codex turn carrying one says so in the thread and runs unfenced.
 
+## Routing groups
+
+A bot's `model` may be a single `provider/model` or a reference to a global group, `group:<id>`. Groups live in `~/.gitbot/routing-groups.json` and are an ordered list of models. The first usable entry is active; on quota, a daily limit, a provider failure (405/408/5xx) or an unknown model (404), the turn is re-sent with the next entry. Auth and malformed-request errors do not rotate.
+
+The active index persists on the thread (`thread.routing`), so a group that moved to model 3 stays there for that conversation until a reset. `src/routing.ts` owns the types, storage, resolution and error classification; `src/routing-ledger.ts` counts tokens per model per UTC day but only for groups that declare `dailyTokenBudgets`. Without a budget, failover is purely reactive.
+
+The UI edits groups from the bot's **Model** tab. Its picker uses `GET /models/catalog`, which asks the provider's own `/v1/models` instead of trusting the snapshot in `opencode.json`. A group in use cannot be deleted (409), and every thread using it shows the active entry as an `n/m` badge in the composer.
+
 ## Workspace and file API
 
 The directory you run `gitbot start` in is the workspace; its subdirectories are listed as repos. `GET /dir` and `GET /file` are a small file browser: both check that the requested path stays inside the given `repoPath` before serving anything, and file reads are capped at 5 MB. `GET /browse` is the folder picker. It is deliberately not confined to the workspace — a thread may run in any folder the gitbot process can read — so it lists folder names across the filesystem.
@@ -103,6 +111,9 @@ GitBot/
 │   ├── bot-store.ts          # Bot + thread persistence (JSON files)
 │   ├── bot-routes.ts         # /bots and /threads
 │   ├── bot-prompt.ts         # Bot + setup prompts, setup verdict — shared by all agents
+│   ├── routing.ts            # Routing groups: storage, resolution, error classification
+│   ├── routing-ledger.ts     # Daily per-model token ledger for declared budgets
+│   ├── model-catalog.ts      # Live provider model list (Magpie /v1/models)
 │   ├── start-claude-code.ts  # Claude Code integration
 │   ├── start-opencode.ts     # OpenCode integration
 │   ├── start-codex.ts        # Codex integration

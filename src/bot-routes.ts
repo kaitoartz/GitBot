@@ -28,9 +28,16 @@ import {
 import { existsSync, statSync } from "fs";
 import { loadTranscript } from "./start-claude-code";
 import { loadTranscript as loadCodexTranscript } from "./start-codex";
-import { getSessionHistory as loadOpencodeHistory } from "./start-opencode";
-import { getOpencodeClientForDir } from "./start-opencode";
+import {
+  getSessionHistory as loadOpencodeHistory,
+  getOpencodeClientForDir,
+  revertSession as revertOpencodeSession,
+  unrevertSession as unrevertOpencodeSession,
+} from "./start-opencode";
 import { buildSessionReport, loadHistoricalUsage, isSeeded, liveMessageIdsOf, getModelInfo } from "./usage";
+import { resolveModelTarget, listRoutingGroups, getRoutingGroup, createRoutingGroup, updateRoutingGroup, deleteRoutingGroup, GROUP_PREFIX } from "./routing";
+import { getSpentToday, resetModels } from "./routing-ledger";
+import { getProviderCatalog, unknownModelRefs } from "./model-catalog";
 
 /**
  * REST surface for the bot hub: bots, their threads, and a thread's messages.
@@ -89,6 +96,170 @@ export async function handleBotRoutes(
     if (!info) { jsonOk(res, { model, known: false }); return true; }
     jsonOk(res, { model, known: true, ...info });
     return true;
+  }
+
+  // GET /models/catalog?provider=magpie — the provider's own live model list.
+  // opencode.json is a stale snapshot for gateways, so the routing editor must
+  // not populate itself from it. `source:"unavailable"` carries a reason and
+  // leaves manual entry possible.
+  if (method === "GET" && path === "/models/catalog") {
+    const provider = (query.provider ?? "magpie").trim() || "magpie";
+    const q = (query.q ?? "").trim().toLowerCase();
+    const catalog = await getProviderCatalog(provider);
+    const models = catalog.models
+      .filter((id) => !q || id.toLowerCase().includes(q))
+      .slice(0, 500)
+      .map((id) => ({ id, ref: `${provider}/${id}` }));
+    jsonOk(res, {
+      provider,
+      models,
+      count: models.length,
+      source: catalog.source,
+      ...(catalog.error ? { error: catalog.error } : {}),
+    });
+    return true;
+  }
+
+  // --- Routing groups ---
+
+  // GET /routing-groups — definitions plus today's spend per model, so a
+  // client can show how close each entry is to its declared budget.
+  if (method === "GET" && path === "/routing-groups") {
+    const groups = listRoutingGroups().map((group) => ({
+      ...group,
+      spentToday: Object.fromEntries(group.models.map((m) => [m, getSpentToday(m)])),
+    }));
+    jsonOk(res, { groups });
+    return true;
+  }
+
+  // POST /routing-groups — create from the editor. Model ids are checked
+  // against the provider's live catalog when it can be reached.
+  if (method === "POST" && path === "/routing-groups") {
+    const body = await readBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) { jsonError(res, 400, "name is required"); return true; }
+    const parsedModels = normalizeModels(body.models);
+    if (parsedModels.error) { jsonError(res, 400, parsedModels.error); return true; }
+    const parsedBudgets = normalizeBudgets(body.dailyTokenBudgets, parsedModels.models!);
+    if (parsedBudgets.error) { jsonError(res, 400, parsedBudgets.error); return true; }
+    const unknown = await unknownModelRefs(parsedModels.models!);
+    if (unknown.length) {
+      jsonError(res, 400, "Some models are not in the provider's catalog", { unknown });
+      return true;
+    }
+    const group = createRoutingGroup({
+      name,
+      models: parsedModels.models!,
+      onError: body.onError === "fail" ? "fail" : "rotate",
+      dailyTokenBudgets: parsedBudgets.budgets,
+      matchers: normalizeMatchers(body.matchers),
+      shortRetryMinutes: normalizeRetry(body.shortRetryMinutes),
+    });
+    jsonOk(res, { group });
+    return true;
+  }
+
+  // POST /routing-groups/:id/reset — forget the ledger for today and send
+  // every thread using the group back to its first entry.
+  const groupResetId = matchId(path, "/routing-groups/", "/reset");
+  if (method === "POST" && groupResetId) {
+    const group = getRoutingGroup(groupResetId);
+    if (!group) { jsonError(res, 404, "Routing group not found"); return true; }
+    resetModels(group.models);
+    const ref = `${GROUP_PREFIX}${group.id}`;
+    const botIds = new Set(listBots().filter((b) => b.model === ref).map((b) => b.id));
+    let threads = 0;
+    for (const thread of listThreads()) {
+      if (botIds.has(thread.botId) && thread.routing?.groupId === group.id) {
+        updateThread(thread.id, { routing: undefined });
+        threads += 1;
+      }
+    }
+    jsonOk(res, { ok: true, group: group.id, models: group.models.length, threads });
+    return true;
+  }
+
+  const groupId = matchId(path, "/routing-groups/");
+  if (groupId) {
+    const group = getRoutingGroup(groupId);
+    if (!group) { jsonError(res, 404, "Routing group not found"); return true; }
+
+    if (method === "GET") {
+      jsonOk(res, {
+        group: {
+          ...group,
+          spentToday: Object.fromEntries(group.models.map((m) => [m, getSpentToday(m)])),
+        },
+      });
+      return true;
+    }
+
+    if (method === "PATCH") {
+      const body = await readBody(req);
+      const patch: Record<string, unknown> = {};
+
+      if (body.name !== undefined) {
+        const name = typeof body.name === "string" ? body.name.trim() : "";
+        if (!name) { jsonError(res, 400, "name cannot be empty"); return true; }
+        patch.name = name;
+      }
+
+      let models = group.models;
+      if (body.models !== undefined) {
+        const parsed = normalizeModels(body.models);
+        if (parsed.error) { jsonError(res, 400, parsed.error); return true; }
+        models = parsed.models!;
+        patch.models = models;
+        // A model already saved in the group is grandfathered: the gateway can
+        // retire or hide it from /v1/models, but that must not block editing
+        // the group's budgets, order or name. Only refs being introduced are
+        // checked against the live catalog.
+        const added = models.filter((ref) => !group.models.includes(ref));
+        const unknown = await unknownModelRefs(added);
+        if (unknown.length) {
+          jsonError(res, 400, "Some models are not in the provider's catalog", { unknown });
+          return true;
+        }
+      }
+
+      if (body.dailyTokenBudgets !== undefined) {
+        const parsed = normalizeBudgets(body.dailyTokenBudgets, models);
+        if (parsed.error) { jsonError(res, 400, parsed.error); return true; }
+        patch.dailyTokenBudgets = parsed.budgets;
+      }
+      if (body.onError !== undefined) {
+        patch.onError = body.onError === "fail" ? "fail" : "rotate";
+      }
+      if (body.matchers !== undefined) {
+        patch.matchers = normalizeMatchers(body.matchers);
+      }
+      if (body.shortRetryMinutes !== undefined) {
+        patch.shortRetryMinutes = normalizeRetry(body.shortRetryMinutes);
+      }
+
+      const updated = updateRoutingGroup(groupId, patch as any);
+      jsonOk(res, { group: updated });
+      return true;
+    }
+
+    if (method === "DELETE") {
+      const ref = `${GROUP_PREFIX}${groupId}`;
+      const users = listBots().filter((b) => b.model === ref);
+      if (users.length) {
+        jsonError(res, 409, `Routing group is used by ${users.length} bot(s)`, {
+          bots: users.map((b) => ({ id: b.id, name: b.name })),
+        });
+        return true;
+      }
+      resetModels(group.models);
+      for (const thread of listThreads()) {
+        if (thread.routing?.groupId === groupId) updateThread(thread.id, { routing: undefined });
+      }
+      deleteRoutingGroup(groupId);
+      jsonOk(res, { deleted: true });
+      return true;
+    }
   }
 
   // --- Bots ---
@@ -202,6 +373,57 @@ export async function handleBotRoutes(
     }
   }
 
+  // /threads/:id/revert stages an OpenCode rewind. The next prompt commits it;
+  // unrevert cancels it. Only OpenCode exposes this, and a running turn must
+  // finish (or abort) before its history can be cut.
+  const revertId = matchId(path, "/threads/", "/revert");
+  if (revertId && method === "POST") {
+    const thread = getThread(revertId);
+    if (!thread) { jsonError(res, 404, "Thread not found"); return true; }
+    if (thread.agent !== "opencode" || !thread.sdkSessionId) {
+      jsonError(res, 400, "Rewind is only available for OpenCode threads with history");
+      return true;
+    }
+    if ([...sessions.values()].some(s => s.threadId === thread.id && s.status === "running")) {
+      jsonError(res, 409, "Session is already running");
+      return true;
+    }
+    const body = await readBody(req);
+    if (typeof body.messageID !== "string" || !body.messageID) {
+      jsonError(res, 400, "messageID is required");
+      return true;
+    }
+    try {
+      await revertOpencodeSession(
+        thread.sdkSessionId,
+        body.messageID,
+        thread.repoPath,
+        typeof body.partID === "string" ? body.partID : undefined,
+      );
+      jsonOk(res, { ok: true });
+    } catch (err: any) {
+      jsonError(res, 500, err?.message ?? "Rewind failed");
+    }
+    return true;
+  }
+
+  const unrevertId = matchId(path, "/threads/", "/unrevert");
+  if (unrevertId && method === "POST") {
+    const thread = getThread(unrevertId);
+    if (!thread) { jsonError(res, 404, "Thread not found"); return true; }
+    if (thread.agent !== "opencode" || !thread.sdkSessionId) {
+      jsonError(res, 400, "Rewind is only available for OpenCode threads with history");
+      return true;
+    }
+    try {
+      await unrevertOpencodeSession(thread.sdkSessionId, thread.repoPath);
+      jsonOk(res, { ok: true });
+    } catch (err: any) {
+      jsonError(res, 500, err?.message ?? "Unrevert failed");
+    }
+    return true;
+  }
+
   // /threads/:id/messages must be matched before /threads/:id
   const messagesId = matchId(path, "/threads/", "/messages");
   if (messagesId && method === "GET") {
@@ -246,13 +468,18 @@ export async function handleBotRoutes(
     }
     let providerID: string | undefined;
     let modelID: string | undefined;
-    // The model rides on the bot, not on the thread.
+    // The model rides on the bot, not on the thread. A routing group resolves
+    // to its active entry for the report.
     const model = getBot(thread.botId)?.model;
     if (model) {
-      const slashIdx = model.indexOf("/");
-      if (slashIdx !== -1) {
-        providerID = model.slice(0, slashIdx);
-        modelID = model.slice(slashIdx + 1);
+      try {
+        const target = resolveModelTarget(model, thread.routing?.index ?? 0);
+        if (target) {
+          providerID = target.providerID;
+          modelID = target.modelID;
+        }
+      } catch {
+        // A dangling group reference must not break the usage endpoint.
       }
     }
     const store = activeStore ?? { gitbotId: threadKey, model };
@@ -300,4 +527,54 @@ function matchId(path: string, prefix: string, suffix = ""): string | null {
   }
   if (!rest || rest.includes("/")) return null;
   return rest;
+}
+
+function normalizeModels(input: unknown): { models?: string[]; error?: string } {
+  if (!Array.isArray(input)) return { error: "models must be an array of provider/model strings" };
+  const models: string[] = [];
+  for (const raw of input) {
+    const ref = typeof raw === "string" ? raw.trim() : "";
+    const slash = ref.indexOf("/");
+    if (slash <= 0 || slash === ref.length - 1) {
+      return { error: `Invalid model "${ref}": expected provider/model` };
+    }
+    if (models.includes(ref)) return { error: `Duplicate model "${ref}"` };
+    models.push(ref);
+  }
+  if (!models.length) return { error: "A routing group needs at least one model" };
+  return { models };
+}
+
+function normalizeBudgets(
+  input: unknown,
+  models: string[],
+): { budgets?: Record<string, number>; error?: string } {
+  if (input == null) return {};
+  if (typeof input !== "object" || Array.isArray(input)) {
+    return { error: "dailyTokenBudgets must be an object keyed by provider/model" };
+  }
+  const budgets: Record<string, number> = {};
+  for (const [ref, raw] of Object.entries(input as Record<string, unknown>)) {
+    if (!models.includes(ref)) return { error: `Budget for "${ref}" is not in this group` };
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { error: `Budget for "${ref}" must be a positive number` };
+    }
+    budgets[ref] = Math.round(value);
+  }
+  return { budgets: Object.keys(budgets).length ? budgets : undefined };
+}
+
+function normalizeMatchers(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [provider, pattern] of Object.entries(input as Record<string, unknown>)) {
+    if (typeof pattern === "string" && pattern) out[provider] = pattern;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function normalizeRetry(input: unknown): number | undefined {
+  const value = Number(input);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
 }

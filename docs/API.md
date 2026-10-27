@@ -43,6 +43,15 @@ A bot is a named, reusable agent preset.
 | `PATCH` | `/bots/:id` | Update any bot field. Returns `{ bot, setupThread? }` |
 | `DELETE` | `/bots/:id` | Delete a bot and its threads |
 | `POST` | `/bots/:id/setup` | Set this machine's setup state. Body: `{ action: "complete" \| "reset" \| "fail" }` |
+| `GET` | `/routing-groups` | `{ groups: RoutingGroup[] }`, each with `spentToday` per model |
+| `POST` | `/routing-groups` | Create a group. Body: `{ name, models, onError?, dailyTokenBudgets? }` |
+| `GET` | `/routing-groups/:id` | `{ group }` with `spentToday` |
+| `PATCH` | `/routing-groups/:id` | Update any group field; newly added model ids are checked against the live catalog (existing entries stay editable if the gateway retires them) |
+| `DELETE` | `/routing-groups/:id` | Delete a group. `409` with `bots` when a bot still uses it |
+| `POST` | `/routing-groups/:id/reset` | Forget today's ledger for the group and send its threads back to the first model. `{ ok, group, models, threads }` |
+| `GET` | `/models/catalog?provider=magpie&q=` | Live model list from the provider's own `/v1/models`, not `opencode.json` |
+
+A bot joins a routing group by setting `model` to `group:<id>` instead of `provider/model`. The group rotates on quota, daily limit, provider failures (405/408/5xx) and unknown models (404). See [ROUTING-PLAN.md](ROUTING-PLAN.md).
 
 **Bot fields**
 
@@ -72,12 +81,14 @@ A thread is one conversation between a bot and a folder.
 | `GET` | `/threads/:id` | `{ thread }` |
 | `PATCH` | `/threads/:id` | Update a thread, e.g. `{ title }` |
 | `DELETE` | `/threads/:id` | Delete the thread. The agent's own transcript stays on disk |
-| `GET` | `/threads/:id/messages` | `{ messages }` - history read from the transcript of the agent the thread runs on |
+| `GET` | `/threads/:id/messages` | `{ messages }` - history read from the transcript of the agent the thread runs on. OpenCode messages carry the agent's `id` |
+| `POST` | `/threads/:id/revert` | Stage an OpenCode rewind to a user message. Body: `{ messageID, partID? }`. The target and everything after it disappear when the next prompt is sent |
+| `POST` | `/threads/:id/unrevert` | Cancel a staged rewind before the next prompt commits it |
 | `GET` | `/threads/:id/usage` | [Usage](#usage) report for OpenCode threads, `null` otherwise |
 
 A thread records `agent` and `sdkSessionId` on its first turn and keeps them: a session id only means something to the agent that issued it. Other fields: `kind` (`chat` \| `setup`), `title`, `repoPath`, `preview`, `messageCount`, `createdAt`, `updatedAt`.
 
-Messages are `{ role: "user" | "assistant", content: Block[] }`, where a block is `{ type: "text", text }`, `{ type: "tool_use", tool_name, tool_input }`, `{ type: "image_url", url, name?, mime? }` or `{ type: "file", url, name?, mime? }` (PDFs and other file parts). `url` is a data URL when the agent stored the bytes.
+Messages are `{ id?, role: "user" | "assistant", content: Block[] }`, where a block is `{ type: "text", text }`, `{ type: "tool_use", tool_name, tool_input }`, `{ type: "image_url", url, name?, mime? }` or `{ type: "file", url, name?, mime? }` (PDFs and other file parts). `url` is a data URL when the agent stored the bytes. `id` is the OpenCode message id; use it as `messageID` in `POST /threads/:id/revert`. Rewind is OpenCode-only and works on user messages.
 
 ## Chat
 
@@ -178,6 +189,8 @@ Events carry a `seq` field and an SSE `id:`, so a client that reconnects with `L
 | `permission_request` | `toolUseID`, `toolName`, `input` | The agent needs approval (Claude Code, OpenCode — Codex never asks; its permission mode selects a sandbox) |
 | `result` | `subtype`, `cost`, `duration_ms`, `num_turns` | Turn statistics (Claude Code) |
 | `agent_error` | `message` | The agent itself reported a problem — provider refused, bad model (OpenCode); a connection retry or transport fallback (Codex). Not terminal on its own: it is followed by a terminal event only if the turn actually fails |
+| `agent_failover` | `group`, `from`, `to`, `reason`, `index`, `total` | A routing group moved to its next model because the previous one reported `quota`, `daily` or `provider`. The turn continues on `to` |
+| `agent_failover_exhausted` | `group`, `name`, `reason`, `attempts[]` | No model left in the routing group. Followed by `error` |
 | `usage` | `scope`, `usage`, `messageID?`, `context?`, `model?`, `parent_tool_use_id?` | Token/cost accounting (OpenCode only). `scope: "turn"` rides along after a real assistant snapshot (`messageID` names its message); `scope: "session"` lands once at turn end with the cumulative total and the resolved context window. A subagent's report carries `parent_tool_use_id`; its tokens count toward the turn total but never toward the parent's context window. See [Usage](#usage) |
 | `done` | — | Turn finished |
 | `aborted` | `message` | Turn was stopped |

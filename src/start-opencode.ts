@@ -1,7 +1,15 @@
 import { execSync, spawn, type ChildProcess } from "child_process";
 import { readFileSync } from "fs";
 import { basename } from "path";
-import { bindSession } from "./bot-store";
+import { bindSession, getThread, updateThread } from "./bot-store";
+import {
+  GROUP_PREFIX,
+  classifyError,
+  getRoutingGroup,
+  isGroupRef,
+  resolveModelTarget,
+  type ModelTarget,
+} from "./routing";
 import { presetSystemPrompt, recordSetupOutcomeFromEvents } from "./bot-prompt";
 import {
   emitEvent,
@@ -21,6 +29,7 @@ import {
   getModelInfo,
 } from "./usage";
 import { filePartFor, mentionText } from "./attachments";
+import { addTokens, getSpentToday } from "./routing-ledger";
 
 async function loadOpencodeSdk() {
   const sdk = await import("@opencode-ai/sdk");
@@ -265,6 +274,10 @@ export async function runAgent(store: SessionStore): Promise<void> {
   store.turnStartedAt = Date.now();
   (store as any)._msgRoles = new Map<string, string>();
   store.lastTaskToolUseId = undefined;
+  store.turnHadOutput = false;
+  store.turnRequest = undefined;
+  store.failoverInFlight = false;
+  store.ledgerTotals = new Map();
 
   try {
     // Inside the try: reaching the opencode server is the first thing that can
@@ -289,17 +302,16 @@ export async function runAgent(store: SessionStore): Promise<void> {
     sdkIdToGitbotId.set(store.sdkSessionId!, store.gitbotId);
 
 
-    // Parse model string into providerID/modelID if provided
-    let modelParam: { providerID: string; modelID: string } | undefined;
-    if (store.model) {
-      const slashIdx = store.model.indexOf("/");
-      if (slashIdx !== -1) {
-        modelParam = {
-          providerID: store.model.slice(0, slashIdx),
-          modelID: store.model.slice(slashIdx + 1),
-        };
-      }
-    }
+    // Resolve the bot's model: a plain "provider/model", or a routing group
+    // (`group:<id>`). A group resumes at the entry its thread last used, so a
+    // model that spent its quota stays skipped until the ledger resets it.
+    const startIndex = groupStartIndex(store);
+    let target = resolveModelTarget(store.model, startIndex);
+    target = skipSpentModels(store, target);
+    const modelParam = target ? { providerID: target.providerID, modelID: target.modelID } : undefined;
+    const modelLabel = target?.model;
+    store.activeModel = target?.model;
+    if (target?.kind === "group") store.routing = { groupId: target.group.id, index: target.index };
 
     const system = presetSystemPrompt(store.botPreset);
     // A bot's disallowed tools are switched off for the message. Bots name
@@ -314,54 +326,37 @@ export async function runAgent(store: SessionStore): Promise<void> {
       const images = binary.filter((a) => a.mime.startsWith("image/"));
       const pdfs = binary.filter((a) => a.mime === "application/pdf");
       if (info && images.length && !info.image) {
-        throw new Error(`Model ${store.model} does not accept image attachments`);
+        throw new Error(`Model ${modelLabel} does not accept image attachments`);
       }
       if (info && pdfs.length && !info.pdf) {
-        throw new Error(`Model ${store.model} does not accept PDF attachments`);
+        throw new Error(`Model ${modelLabel} does not accept PDF attachments`);
       }
     }
     const fileParts = await Promise.all(binary.map(filePartFor));
 
-    // Reasoning variant: a per-message lever OpenCode 1.x accepts in the
-    // prompt body (the SDK types lag behind). Only send it when the model
-    // actually declares that variant; anything else is the model default.
-    let variant: string | undefined;
-    if (store.variant && modelParam) {
-      const info = getModelInfo(modelParam.providerID, modelParam.modelID);
-      if (info?.variants.includes(store.variant)) variant = store.variant;
-    }
+    // Kept on the store: if OpenCode reports the quota error over the event
+    // stream instead of on the prompt call, the turn is re-sent from here.
+    store.turnRequest = {
+      parts: [
+        ...(prompt || mentions ? [{ type: "text" as const, text: [prompt, mentions].filter(Boolean).join("\n\n") }] : []),
+        ...fileParts,
+        ...legacyAttachments.map(att => ({ type: "file" as const, mime: "image/jpeg", url: att.url })),
+      ],
+      variant: store.variant,
+      mode: store.mode,
+      system,
+      tools,
+    };
 
-    // Use promptAsync so the request returns immediately; completion signaled via event stream
-    const promptResult = await client.session.promptAsync({
-      path: { id: store.sdkSessionId! },
-      body: {
-        parts: [
-          ...(prompt || mentions ? [{ type: "text" as const, text: [prompt, mentions].filter(Boolean).join("\n\n") }] : []),
-          ...fileParts,
-          ...legacyAttachments.map(att => ({ type: "file" as const, mime: "image/jpeg", url: att.url })),
-        ],
-        ...(modelParam ? { model: modelParam } : {}),
-        ...(variant ? { variant } : {}),
-        ...(store.mode ? { agent: store.mode } : {}),
-        // A bot is a preset: its instructions ride along as the system prompt.
-        // OpenCode takes it per message, so it is sent on every turn.
-        ...(system ? { system } : {}),
-        ...(tools ? { tools } : {}),
-      },
-    });
-    if (promptResult.error) {
-      // The SDK wraps server errors as { name, data: { message, kind } }.
-      const errObj: any = promptResult.error;
-      const errMsg =
-        errObj?.data?.message ||
-        errObj?.message ||
-        errObj?.detail ||
-        (typeof errObj === "string" ? errObj : "Prompt failed");
-      console.error("[query] promptAsync error:", errMsg, JSON.stringify(errObj).slice(0, 500));
-      emitEvent(store, "agent_error", { message: errMsg });
+    // promptAsync returns immediately; completion signaled via event stream.
+    const sent = await sendTurnPrompt(store, client, target, store.turnRequest);
+    if (!sent.ok) {
+      console.error("[query] promptAsync error:", sent.message);
+      emitEvent(store, "agent_error", { message: sent.message });
       // The turn never started, so no idle event will follow: close the stream.
-      emitEvent(store, "error", { message: errMsg });
+      emitEvent(store, "error", { message: sent.message });
       store.status = "error";
+      store.turnRequest = undefined;
       notifyPermissionsChanged();
       scheduleCleanup(store);
       return;
@@ -373,16 +368,266 @@ export async function runAgent(store: SessionStore): Promise<void> {
     // The turn never started, so no idle event will follow: close the stream.
     emitEvent(store, "error", { message: err?.message ?? "Unknown error" });
     store.status = "error";
+    store.turnRequest = undefined;
     notifyPermissionsChanged();
     scheduleCleanup(store);
   }
 }
 
 /**
- * A bot's tool lists as OpenCode's per-message switch map. Allowed tools are the
- * only tools the bot has, so every other tool OpenCode knows is switched off.
- * If the tool list cannot be read the turn fails rather than run unfenced.
+ * The group entry this thread last landed on. A spent model stays skipped for
+ * the next turn; the daily ledger (Phase 2) and the manual reset clear it.
  */
+function groupStartIndex(store: SessionStore): number {
+  if (!isGroupRef(store.model) || !store.threadId) return 0;
+  const thread = getThread(store.threadId);
+  const groupId = store.model!.slice(GROUP_PREFIX.length);
+  if (thread?.routing?.groupId !== groupId) return 0;
+  return thread.routing.index;
+}
+
+/**
+ * Skips group entries whose declared daily budget is already spent, before a
+ * request is sent. Models without a declared budget are never skipped: the
+ * ledger only knows what the group told it. Throws when every entry is spent,
+ * so the turn ends with a readable error instead of a pointless provider call.
+ */
+function skipSpentModels(store: SessionStore, initial: ModelTarget | undefined): ModelTarget | undefined {
+  let target = initial;
+  for (;;) {
+    if (!target || target.kind !== "group") return target;
+    const budget = target.group.dailyTokenBudgets?.[target.model];
+    if (!budget || budget <= 0) return target;
+    const spent = getSpentToday(target.model);
+    if (spent < budget) return target;
+
+    const stepped = tryFailover(
+      store,
+      target,
+      "daily",
+      "daily_budget",
+      `budget diario agotado (${spent}/${budget} tokens)`,
+    );
+    if (stepped.target) {
+      target = stepped.target;
+      continue;
+    }
+    if (stepped.exhausted) {
+      throw new Error(`Routing group "${target.group.name}" has no budget left today`);
+    }
+    return target;
+  }
+}
+
+/** The SDK wraps server errors as `{ name, data: { message, kind } }`. */
+function promptErrorMessage(err: any): string {
+  return (
+    err?.data?.message ||
+    err?.message ||
+    err?.detail ||
+    (typeof err === "string" ? err : "Prompt failed")
+  );
+}
+
+/** Only send the reasoning variant to models that declare it. */
+function resolveVariant(store: SessionStore, target: ModelTarget | undefined): string | undefined {
+  if (!store.variant || !target) return undefined;
+  const info = getModelInfo(target.providerID, target.modelID);
+  return info?.variants.includes(store.variant) ? store.variant : undefined;
+}
+
+/**
+ * Moves a routing group one entry down. Returns the new target, an `exhausted`
+ * marker when there is nowhere left to go, or nothing when this error is not
+ * one another model can fix (auth, malformed request, a direct model, a group
+ * explicitly told not to rotate).
+ */
+function tryFailover(
+  store: SessionStore,
+  target: ModelTarget | undefined,
+  kind: ReturnType<typeof classifyError>,
+  reason: string,
+  detail = "",
+): { target?: ModelTarget; exhausted?: boolean } {
+  if (!target || target.kind !== "group") return {};
+  if (kind !== "quota" && kind !== "daily" && kind !== "provider" && kind !== "model") return {};
+  const group = target.group;
+  if (group.onError === "fail" || group.models.length <= 1) return {};
+
+  const nextIndex = target.index + 1;
+  if (nextIndex >= group.models.length) {
+    emitEvent(store, "agent_failover_exhausted", {
+      group: group.id,
+      name: group.name,
+      reason,
+      detail,
+      attempts: group.models.slice(0, target.index + 1).map((model) => ({
+        model,
+        reason: model === target.model ? reason : "unavailable",
+      })),
+    });
+    return { exhausted: true };
+  }
+
+  const next = resolveModelTarget(store.model, nextIndex);
+  if (!next) return {};
+  store.routing = { groupId: group.id, index: nextIndex };
+  store.activeModel = next.model;
+  if (store.threadId) {
+    updateThread(store.threadId, { routing: { groupId: group.id, index: nextIndex } });
+  }
+  emitEvent(store, "agent_failover", {
+    group: group.id,
+    from: target.model,
+    to: next.model,
+    reason,
+    detail,
+    index: nextIndex,
+    total: group.models.length,
+  });
+  console.log(`[routing] ${group.id}: ${target.model} -> ${next.model} (${reason}: ${detail})`);
+  return { target: next };
+}
+
+/**
+ * Test hook: pretend the provider answered 429 without spending quota.
+ * `GITBOT_ROUTING_FORCE_FAIL=first` fails the group's first entry;
+ * `GITBOT_ROUTING_FORCE_FAIL=provider/model,...` fails those exact entries.
+ */
+function forcedFailure(target: ModelTarget | undefined): string | undefined {
+  const spec = process.env.GITBOT_ROUTING_FORCE_FAIL?.trim();
+  if (!spec || !target || target.kind !== "group") return undefined;
+  const matches =
+    spec === "first"
+      ? target.index === 0
+      : spec.split(",").map((s) => s.trim()).filter(Boolean).includes(target.model);
+  return matches ? `Forced failover (GITBOT_ROUTING_FORCE_FAIL): ${target.model}` : undefined;
+}
+
+/**
+ * Sends one turn, rotating down the group while the provider says the current
+ * model is out. Each retry replaces the failed prompt, so a 429 that never
+ * started the turn cannot double-charge or duplicate the user message.
+ */
+async function sendTurnPrompt(
+  store: SessionStore,
+  client: any,
+  initial: ModelTarget | undefined,
+  request: NonNullable<SessionStore["turnRequest"]>,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  let target = initial;
+  let lastMessage = "Prompt failed";
+
+  for (;;) {
+    const variant = resolveVariant(store, target);
+    const forced = forcedFailure(target);
+    const result = forced
+      ? { error: { status: 429, message: forced } }
+      : await client.session.promptAsync({
+          path: { id: store.sdkSessionId! },
+          body: {
+            parts: request.parts,
+            ...(target ? { model: { providerID: target.providerID, modelID: target.modelID } } : {}),
+            ...(variant ? { variant } : {}),
+            ...(request.mode ? { agent: request.mode } : {}),
+            // A bot is a preset: its instructions ride along as the system prompt.
+            // OpenCode takes it per message, so it is sent on every turn.
+            ...(request.system ? { system: request.system } : {}),
+            ...(request.tools ? { tools: request.tools } : {}),
+          },
+        });
+    if (!result.error) return { ok: true };
+
+    lastMessage = promptErrorMessage(result.error);
+    const kind = classifyError(result.error, target?.providerID, target?.group);
+    const stepped = tryFailover(store, target, kind, kind, lastMessage);
+    if (stepped.target) {
+      target = stepped.target;
+      continue;
+    }
+    if (stepped.exhausted && target?.kind === "group") {
+      return {
+        ok: false,
+        message: `${lastMessage} — routing group "${target.group.name}" exhausted`,
+      };
+    }
+    return { ok: false, message: lastMessage };
+  }
+}
+
+/**
+ * A quota error can also arrive over the event stream after the prompt was
+ * accepted. Re-prompting is only safe when the assistant has not written
+ * anything yet: otherwise the user message would appear twice in the thread.
+ * Returns true when the turn was handed to the next model.
+ */
+async function failoverFromStreamError(store: SessionStore, err: any): Promise<boolean> {
+  if (store.status !== "running" || store.turnHadOutput || !store.turnRequest) return false;
+
+  const target = resolveModelTarget(store.model, store.routing?.index ?? groupStartIndex(store));
+  if (!target || target.kind !== "group") return false;
+
+  const kind = classifyError(err, target.providerID, target.group);
+  const stepped = tryFailover(store, target, kind, kind, promptErrorMessage(err));
+  if (!stepped.target) return false;
+
+  const message = promptErrorMessage(err);
+  try {
+    const client = await getClientForDir(store.repoPath);
+    // The idle/reconcile path may have settled the turn while we connected.
+    if (store.status !== "running") return true;
+    const sent = await sendTurnPrompt(store, client, stepped.target, store.turnRequest);
+    if (sent.ok) return true;
+    console.error("[query] failover prompt failed:", sent.message);
+    emitEvent(store, "agent_error", { message: sent.message });
+    emitEvent(store, "error", { message: sent.message });
+  } catch (e: any) {
+    console.error("[query] failover crashed:", e?.message);
+    emitEvent(store, "agent_error", { message: e?.message ?? message });
+    emitEvent(store, "error", { message: e?.message ?? message });
+  }
+  store.status = "error";
+  store.turnRequest = undefined;
+  store.pendingPermissions.clear();
+  notifyPermissionsChanged();
+  scheduleCleanup(store);
+  return true;
+}
+
+/**
+ * The single entry point for `session.error`. Rotates when the error is a
+ * quota one and the turn has not produced output; otherwise reports it like
+ * before. Async because the retry is another prompt call.
+ */
+async function handleSessionError(store: SessionStore, err: any): Promise<void> {
+  if (store.failoverInFlight || store.status !== "running") return;
+  store.failoverInFlight = true;
+  try {
+    if (await failoverFromStreamError(store, err)) return;
+    const reason = promptErrorMessage(err);
+    // Name the model and status: without them the message alone does not say
+    // which hop of a routing group failed, or why it looked empty.
+    const status = err?.data?.statusCode ?? err?.status ?? err?.statusCode ?? err?.data?.status;
+    const message = [
+      store.activeModel ? `${store.activeModel}:` : "",
+      reason,
+      typeof status === "number" ? `(HTTP ${status})` : "",
+    ].filter(Boolean).join(" ") || "Session error";
+    emitEvent(store, "agent_error", { message });
+    // Terminal: the UI only closes and shows the error once it receives this,
+    // and OpenCode will not send another one for the same failed turn.
+    emitEvent(store, "error", { message });
+    store.status = "error";
+    store.turnRequest = undefined;
+    store.pendingPermissions.clear();
+    notifyPermissionsChanged();
+    scheduleCleanup(store);
+  } finally {
+    store.failoverInFlight = false;
+  }
+}
+
+
 async function presetTools(
   client: Awaited<ReturnType<typeof getClientForDir>>,
   store: SessionStore,
@@ -413,12 +658,16 @@ export async function getOpencodeClientForDir(directory: string = ""): Promise<a
   return getClientForDir(directory);
 }
 
-export async function getSessionHistory(sdkSessionId: string, directory: string = ""): Promise<{ role: string; content: any[] }[]> {
+export async function getSessionHistory(sdkSessionId: string, directory: string = ""): Promise<{ id?: string; role: string; content: any[] }[]> {
   const client = await getClientForDir(directory);
   try {
     const messagesResult = await client.session.messages({ path: { id: sdkSessionId } });
     const allMsgs = messagesResult.data ?? [];
-    const history: { role: string; content: any[] }[] = [];
+    const history: { id?: string; role: string; content: any[] }[] = [];
+    // A failover re-prompts the same turn, and OpenCode keeps the user message
+    // of every failed attempt. Collapse a run of identical consecutive user
+    // messages so the thread does not show "Di hola" twice.
+    let lastUserText: string | null = null;
     for (const msg of allMsgs) {
       const role = (msg as any).info?.role;
       const parts = (msg as any).parts ?? [];
@@ -464,7 +713,19 @@ export async function getSessionHistory(sdkSessionId: string, directory: string 
             });
           }
         }
-        if (blocks.length) history.push({ role, content: blocks });
+        if (blocks.length) {
+          if (role === "user") {
+            const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
+            if (text && text === lastUserText) continue;
+            lastUserText = text;
+          } else {
+            // Any assistant content ends the run; a failed assistant message
+            // has no blocks and leaves the run open on purpose.
+            lastUserText = null;
+          }
+          const id = (msg as any).info?.id;
+          history.push({ ...(typeof id === "string" ? { id } : {}), role, content: blocks });
+        }
       }
     }
     return history;
@@ -506,6 +767,29 @@ export async function abortSession(sdkSessionId: string, directory: string = "")
   await client.session.abort({ path: { id: sdkSessionId } });
 }
 
+/**
+ * Stage a rewind: OpenCode hides the target message and everything after it,
+ * and rolls file changes back when the next prompt is committed. The caller
+ * must either send a prompt (commit) or unrevert (cancel).
+ */
+export async function revertSession(
+  sdkSessionId: string,
+  messageID: string,
+  directory: string = "",
+  partID?: string,
+): Promise<void> {
+  const client = await getClientForDir(directory);
+  await client.session.revert({
+    path: { id: sdkSessionId },
+    body: { messageID, ...(partID ? { partID } : {}) },
+  });
+}
+
+export async function unrevertSession(sdkSessionId: string, directory: string = ""): Promise<void> {
+  const client = await getClientForDir(directory);
+  await client.session.unrevert({ path: { id: sdkSessionId } });
+}
+
 export async function respondPermission(
   sdkSessionId: string,
   permissionId: string,
@@ -539,15 +823,18 @@ function findStoreByOpencodeSdkId(sdkId: string): SessionStore | undefined {
  * both paths end a turn identically.
  */
 function finalizeTurn(store: SessionStore): void {
-  if (store.status === "done") return;
+  // A turn that already failed must not be re-closed as a success: emitting
+  // `done` here would clear the error the UI is showing.
+  if (store.status !== "running") return;
   // Emit final session usage report with context window
   let providerID: string | undefined;
   let modelID: string | undefined;
-  if (store.model) {
-    const slashIdx = store.model.indexOf("/");
+  const active = store.activeModel ?? store.model;
+  if (active) {
+    const slashIdx = active.indexOf("/");
     if (slashIdx !== -1) {
-      providerID = store.model.slice(0, slashIdx);
-      modelID = store.model.slice(slashIdx + 1);
+      providerID = active.slice(0, slashIdx);
+      modelID = active.slice(slashIdx + 1);
     }
   }
   const sessionReport = buildSessionReport(
@@ -558,6 +845,8 @@ function finalizeTurn(store: SessionStore): void {
   recordSetupOutcomeFromEvents(store);
   store.status = "done";
   store.turnStartedAt = undefined;
+  store.turnRequest = undefined;
+  store.turnHadOutput = false;
   store.pendingPermissions.clear();
   notifyPermissionsChanged();
   emitEvent(store, "done", {});
@@ -704,8 +993,24 @@ async function startEventStream(client: any, directory: string) {
         // Usage for the parent and for children: a subagent's tokens count
         // toward the turn total but not toward the parent's context window.
         if (info?.role === "assistant") {
+          // Some providers surface a failure as an assistant message carrying
+          // `error` and no parts (e.g. a dead endpoint). Treat it like the
+          // session.error event so the group can move on instead of ending
+          // the turn with an invisible empty reply.
+          if (info.error && !isChildEvent) void handleSessionError(store, info.error);
           const snapshot = parseUsageFromMessage(props);
           if (snapshot) {
+            // Ledger only when the active group set a budget for this model;
+            // otherwise every message would pay for a pointless file write.
+            const ref = info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : "";
+            const group = store.routing ? getRoutingGroup(store.routing.groupId) : undefined;
+            if (ref && group?.dailyTokenBudgets?.[ref]) {
+              const totals = store.ledgerTotals ?? (store.ledgerTotals = new Map());
+              const prev = totals.get(info.id) ?? 0;
+              const delta = Math.max(0, snapshot.total - prev);
+              if (delta > 0) addTokens(ref, delta);
+              totals.set(info.id, Math.max(prev, snapshot.total));
+            }
             const report = buildTurnReport(info.id, snapshot, store.model);
             if (report) {
               accumulateUsage(store.gitbotId, snapshot, info.id, { updateWindow: !isChildEvent });
@@ -725,6 +1030,7 @@ async function startEventStream(client: any, directory: string) {
         if (part.type === "text") {
           const text = part.text ?? "";
           if (text && msgRole === "assistant") {
+            store.turnHadOutput = true;
             emitEvent(store, "assistant", {
               content: text,
               ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
@@ -743,6 +1049,7 @@ async function startEventStream(client: any, directory: string) {
               if (part.callID) store.lastTaskToolUseId = part.callID;
               trackTaskSubagent(store, part);
             }
+            if (!isChildEvent) store.turnHadOutput = true;
             emitEvent(store, "tool_use", {
               tool_name: part.tool,
               tool_input: label,
@@ -821,12 +1128,9 @@ async function startEventStream(client: any, directory: string) {
 
       if (type === "session.error") {
         const err = props?.error;
-        const message = err?.data?.message || err?.message || err?.name || "Session error";
-        emitEvent(store, "agent_error", { message });
-        store.status = "error";
-        store.pendingPermissions.clear();
-        notifyPermissionsChanged();
-        scheduleCleanup(store);
+        // Fire-and-forget: the retry is another prompt call, and the stream
+        // must stay free to deliver later events.
+        void handleSessionError(store, err);
       }
 
       if (type === "session.idle" || (type === "session.status" && props?.status?.type === "idle")) {
