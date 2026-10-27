@@ -35,6 +35,7 @@ import { botPermissionToSession } from "./server-common";
 import { resolveAttachments, publicAttachment, mentionText, filePartFor, type PendingAttachment } from "./attachments";
 import { getModelInfo } from "./usage";
 import { uiFileFor } from "./static-ui";
+import { refreshAllDynamicGroups } from "./routing";
 
 export async function handleRequest(
   req: IRequest,
@@ -571,7 +572,31 @@ export async function start(network: string = "local", portOverride?: number, ca
   });
 
   process.on("exit", stopOpencode);
+
+  // Dynamic routing groups pull their model list from a provider's live
+  // catalog, so they are re-synced at startup and on a timer. A transient
+  // gateway outage never empties them: refresh keeps the last snapshot. Set
+  // GITBOT_DYNAMIC_REFRESH_MS=0 to disable the timer (startup refresh still runs).
+  refreshAllDynamicGroups()
+    .then(({ refreshed, failed }) => {
+      if (refreshed || failed) {
+        console.log(`  dynamic groups: ${refreshed} refreshed, ${failed} failed`);
+      }
+    })
+    .catch((err) => console.warn("[routing] startup refresh failed:", err?.message));
+  const refreshMs = Number(process.env.GITBOT_DYNAMIC_REFRESH_MS ?? 600_000);
+  const timer =
+    Number.isFinite(refreshMs) && refreshMs > 0
+      ? setInterval(() => {
+          refreshAllDynamicGroups().catch((err) =>
+            console.warn("[routing] periodic refresh failed:", err?.message),
+          );
+        }, refreshMs)
+      : null;
+  timer?.unref?.();
+
   setupShutdown(() => {
+    if (timer) clearInterval(timer);
     stopOpencode();
     server.close(() => process.exit(0));
   }, caffeinatePid);

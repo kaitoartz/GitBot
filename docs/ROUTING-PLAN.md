@@ -198,6 +198,25 @@ Cada fase = estado usable y demostrable, `npm run check` verde, con guion de ace
 - Solo OpenCode: Claude Code y Codex no tienen equivalente y no muestran las acciones. Un turno corriendo bloquea el corte con `409`.
 - **Aceptación:** editar un mensaje de usuario, cambiar el texto y enviarlo; el mensaje original y su respuesta desaparecen, el nuevo turno arranca desde ahí y el historial recargado coincide.
 
+### Fase 5 — Grupos dinámicos por provider (source-driven)
+
+**Estado: implementada** (`GroupSource` en `src/routing.ts`, `catalogModelRefs` en `src/model-catalog.ts`, `POST /routing-groups/:id/refresh`, auto-refresh en `src/server.ts`, UI en `ui/app/components/routing-group-editor.tsx`).
+
+- **Problema que resuelve:** un grupo estático guarda una lista de `models[]` escrita a mano. Se stalea (Magpie agrega/retira ids sin avisar) y se cuelan ids inválidos: el grupo "todos los modelos" escrito a mano tenía 4 ids malos (`auto/tongyi-skynet-llm-fd` no existe, el correcto es `qwen/...`), y el primero disparaba el error del gateway en cada primer turno.
+- **Diseño:** un grupo dinámico no guarda ids manuales. Guarda `source: { provider, include?, exclude?, onlyFree? }`. El servidor puebla `models[]` desde el catálogo vivo del provider (`/v1/models`):
+  - al crear el grupo (POST con `source` en vez de `models`),
+  - en `POST /routing-groups/:id/refresh`,
+  - al arrancar el server (startup) y cada 10 min (timer; `GITBOT_DYNAMIC_REFRESH_MS=0` lo apaga, el startup siempre corre).
+- **Resiliencia:** si el gateway cae, el refresh deja el último snapshot intacto (nunca vacía el grupo mid-turno); registra el fallo en `sourceStatus.error`. Los ids vienen del propio catálogo, así que nunca son inválidos.
+- **`resolveModelTarget` sigue síncrono.** El hot path del turno (`start-opencode.ts`) no se toca: el snapshot poblado vive en `models[]` como un grupo estático más.
+- **Validación:** en POST/PATCH con `source`, se skipea `unknownModelRefs` (los refs vienen del catálogo, re-fetchear sería redundante). En modo estático, la validación existente sigue igual (con grandfathering de ids ya guardados).
+- **UI:** toggle "Pull models from the provider catalog (dynamic)" en el editor. Marcado → campos provider/include(exclude)/onlyFree + botón "Refresh now" + badge `sourceStatus`. Desmarcado → vuelve al editor manual con el snapshot actual como lista estática.
+- **Filtros:** `include`/`exclude` son regex case-insensitive (una regex mala se ignora, no bloquea el guardado); `onlyFree` keep ids con `:free` o `free` en el path.
+- **`rg_todos`** recreado dinámico: `source: { provider: "magpie", exclude: "pre-mock_new_gateway_session_affinity" }`, 332 modelos (snapshot), bot A apunta a él. `rg_prueba` intacto.
+- **Aceptación:** crear un grupo dinámico desde la UI → se llena con el catálogo vivo y sin ids inválidos; cambiar `onlyFree` → la lista se reduce a los free; "Refresh now" actualiza el snapshot; reiniciar el server → el startup-refresh confirma el snapshot; gateway caído → el grupo sigue sirviendo el último snapshot.
+
+> **No confundir con la "Fase 5 (opcional)" del [MASTERPLAN.md](MASTERPLAN.md):** aquella es el orquestador que delega a otros bots (subagentes durable). Esta Fase 5 del routing plan es la evolución del catálogo de grupos: source-driven en vez de ids manuales. Ambas pueden coexistir.
+
 ---
 
 ## 5. Riesgos y decisiones abiertas

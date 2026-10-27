@@ -88,6 +88,8 @@ The active index persists on the thread (`thread.routing`), so a group that move
 
 The UI edits groups from the bot's **Model** tab. Its picker uses `GET /models/catalog`, which asks the provider's own `/v1/models` instead of trusting the snapshot in `opencode.json`. A group in use cannot be deleted (409), and every thread using it shows the active entry as an `n/m` badge in the composer.
 
+**Dynamic groups (source-driven).** A group may set `source: { provider, include?, exclude?, onlyFree? }` instead of a hand-written `models[]` list. The server then populates `models` from that provider's live `/v1/models` — on create, on `POST /routing-groups/:id/refresh`, at startup, and on a timer (default 10 min; `GITBOT_DYNAMIC_REFRESH_MS=0` disables the timer, the startup refresh always runs). The snapshot stays the source of truth at turn time, so `resolveModelTarget` is still synchronous and the hot path is untouched. If the gateway is unreachable, the last snapshot is kept and the failure is recorded in `sourceStatus.error` — a transient outage never empties the group mid-turn. Ids come from the catalog itself, so they can never be stale or misspelled the way a hand-written list can.
+
 ## Workspace and file API
 
 The directory you run `gitbot start` in is the workspace; its subdirectories are listed as repos. `GET /dir` and `GET /file` are a small file browser: both check that the requested path stays inside the given `repoPath` before serving anything, and file reads are capped at 5 MB. `GET /browse` is the folder picker. It is deliberately not confined to the workspace — a thread may run in any folder the gitbot process can read — so it lists folder names across the filesystem.

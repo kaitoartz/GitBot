@@ -4989,6 +4989,56 @@ button.file-chip:hover {
 .routing-add-row select { flex: 1 1 200px; }
 .routing-add-row .btn-secondary { flex: none; }
 
+.routing-dynamic {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding-block: var(--space-3);
+}
+/* .modal .field input puts width:100% + border + padding on every input,
+   which turns checkboxes into full-width boxes. Override for this section. */
+.routing-dynamic input[type="checkbox"] {
+  width: auto;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  margin: 0;
+  accent-color: var(--accent, currentColor);
+  flex: none;
+}
+.routing-dynamic-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 600;
+}
+.routing-dynamic-toggle input { flex: none; }
+.routing-dynamic-fields {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.routing-dynamic-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+.routing-dynamic-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  font-weight: 400;
+}
+.routing-dynamic-mini input[type="checkbox"] { flex: none; }
+.routing-dynamic-status {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
 .routing-notice {
   margin: var(--space-3) 0;
   color: var(--muted);

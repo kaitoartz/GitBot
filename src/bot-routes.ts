@@ -35,9 +35,9 @@ import {
   unrevertSession as unrevertOpencodeSession,
 } from "./start-opencode";
 import { buildSessionReport, loadHistoricalUsage, isSeeded, liveMessageIdsOf, getModelInfo } from "./usage";
-import { resolveModelTarget, listRoutingGroups, getRoutingGroup, createRoutingGroup, updateRoutingGroup, deleteRoutingGroup, GROUP_PREFIX } from "./routing";
+import { resolveModelTarget, listRoutingGroups, getRoutingGroup, createRoutingGroup, updateRoutingGroup, deleteRoutingGroup, GROUP_PREFIX, refreshGroupFromSource, type GroupSource } from "./routing";
 import { getSpentToday, resetModels } from "./routing-ledger";
-import { getProviderCatalog, unknownModelRefs } from "./model-catalog";
+import { getProviderCatalog, unknownModelRefs, catalogModelRefs } from "./model-catalog";
 
 /**
  * REST surface for the bot hub: bots, their threads, and a thread's messages.
@@ -133,28 +133,54 @@ export async function handleBotRoutes(
     return true;
   }
 
-  // POST /routing-groups — create from the editor. Model ids are checked
-  // against the provider's live catalog when it can be reached.
+  // POST /routing-groups — create from the editor. Two shapes:
+  //  1. Static: an explicit `models` array, checked against the provider's live
+  //     catalog when it can be reached.
+  //  2. Dynamic: a `source` (provider + filters); the server pulls the model
+  //     list from that provider's /v1/models, so the saved ids are always valid.
   if (method === "POST" && path === "/routing-groups") {
     const body = await readBody(req);
     const name = typeof body.name === "string" ? body.name.trim() : "";
     if (!name) { jsonError(res, 400, "name is required"); return true; }
-    const parsedModels = normalizeModels(body.models);
-    if (parsedModels.error) { jsonError(res, 400, parsedModels.error); return true; }
-    const parsedBudgets = normalizeBudgets(body.dailyTokenBudgets, parsedModels.models!);
-    if (parsedBudgets.error) { jsonError(res, 400, parsedBudgets.error); return true; }
-    const unknown = await unknownModelRefs(parsedModels.models!);
-    if (unknown.length) {
-      jsonError(res, 400, "Some models are not in the provider's catalog", { unknown });
-      return true;
+
+    const src = normalizeSource(body.source);
+    if (src.error) { jsonError(res, 400, src.error); return true; }
+
+    let models: string[];
+    if (src.source) {
+      // Dynamic: the catalog is the source of truth, so unknownModelRefs would
+      // only re-fetch the same list. Skip it and store the snapshot.
+      const { refs, error } = await catalogModelRefs(src.source.provider, src.source);
+      if (error) {
+        jsonError(res, 502, `Could not read catalog for "${src.source.provider}": ${error}`);
+        return true;
+      }
+      if (!refs.length) {
+        jsonError(res, 400, `Catalog for "${src.source.provider}" returned no models after filters`);
+        return true;
+      }
+      models = refs;
+    } else {
+      const parsedModels = normalizeModels(body.models);
+      if (parsedModels.error) { jsonError(res, 400, parsedModels.error); return true; }
+      models = parsedModels.models!;
+      const unknown = await unknownModelRefs(models);
+      if (unknown.length) {
+        jsonError(res, 400, "Some models are not in the provider's catalog", { unknown });
+        return true;
+      }
     }
+
+    const parsedBudgets = normalizeBudgets(body.dailyTokenBudgets, models);
+    if (parsedBudgets.error) { jsonError(res, 400, parsedBudgets.error); return true; }
     const group = createRoutingGroup({
       name,
-      models: parsedModels.models!,
+      models,
       onError: body.onError === "fail" ? "fail" : "rotate",
       dailyTokenBudgets: parsedBudgets.budgets,
       matchers: normalizeMatchers(body.matchers),
       shortRetryMinutes: normalizeRetry(body.shortRetryMinutes),
+      source: src.source,
     });
     jsonOk(res, { group });
     return true;
@@ -177,6 +203,27 @@ export async function handleBotRoutes(
       }
     }
     jsonOk(res, { ok: true, group: group.id, models: group.models.length, threads });
+    return true;
+  }
+
+  // POST /routing-groups/:id/refresh — repopulate a dynamic group's models
+  // from its provider's live catalog. Static groups return the current list
+  // unchanged with a `reason: not_dynamic` note.
+  const groupRefreshId = matchId(path, "/routing-groups/", "/refresh");
+  if (method === "POST" && groupRefreshId) {
+    const before = getRoutingGroup(groupRefreshId);
+    if (!before) { jsonError(res, 404, "Routing group not found"); return true; }
+    const result = await refreshGroupFromSource(groupRefreshId);
+    if (result.reason === "not_found") { jsonError(res, 404, "Routing group not found"); return true; }
+    if (result.reason === "not_dynamic") {
+      jsonOk(res, { group: before, refreshed: false, reason: "not_dynamic" });
+      return true;
+    }
+    if (result.error) {
+      jsonError(res, 502, `Catalog refresh failed: ${result.error}`, { group: result.group });
+      return true;
+    }
+    jsonOk(res, { group: result.group, refreshed: true, count: result.group?.models.length ?? 0 });
     return true;
   }
 
@@ -205,8 +252,30 @@ export async function handleBotRoutes(
         patch.name = name;
       }
 
-      let models = group.models;
-      if (body.models !== undefined) {
+      // A `source` patch re-pulls the models from the provider's catalog, so
+      // the editor can switch a group between static and dynamic, or narrow a
+      // dynamic group's filters. `source: null` clears it (back to static).
+      if (body.source !== undefined) {
+        const src = normalizeSource(body.source);
+        if (src.error) { jsonError(res, 400, src.error); return true; }
+        if (src.source) {
+          const { refs, error } = await catalogModelRefs(src.source.provider, src.source);
+          if (error) {
+            jsonError(res, 502, `Could not read catalog for "${src.source.provider}": ${error}`);
+            return true;
+          }
+          if (!refs.length) {
+            jsonError(res, 400, `Catalog for "${src.source.provider}" returned no models after filters`);
+            return true;
+          }
+          patch.models = refs;
+          patch.source = src.source;
+        } else {
+          // Clearing source keeps the current snapshot as a static list.
+          patch.source = undefined;
+        }
+      } else if (body.models !== undefined) {
+        let models = group.models;
         const parsed = normalizeModels(body.models);
         if (parsed.error) { jsonError(res, 400, parsed.error); return true; }
         models = parsed.models!;
@@ -224,6 +293,7 @@ export async function handleBotRoutes(
       }
 
       if (body.dailyTokenBudgets !== undefined) {
+        const models = (patch.models as string[] | undefined) ?? group.models;
         const parsed = normalizeBudgets(body.dailyTokenBudgets, models);
         if (parsed.error) { jsonError(res, 400, parsed.error); return true; }
         patch.dailyTokenBudgets = parsed.budgets;
@@ -577,4 +647,25 @@ function normalizeMatchers(input: unknown): Record<string, string> | undefined {
 function normalizeRetry(input: unknown): number | undefined {
   const value = Number(input);
   return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+}
+
+/**
+ * Coerces a `source` object from the editor/API into a GroupSource. Returns
+ * `undefined` (no source, static group) when input is null/missing. A bad
+ * regex string is kept as-is: the filter simply ignores patterns that fail to
+ * compile, so a typo never blocks saving the group.
+ */
+function normalizeSource(input: unknown): { source?: GroupSource; error?: string } {
+  if (input == null) return {};
+  if (typeof input !== "object" || Array.isArray(input)) {
+    return { error: "source must be an object with provider, include, exclude, onlyFree" };
+  }
+  const raw = input as Record<string, unknown>;
+  const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+  if (!provider) return { error: "source.provider is required" };
+  const source: GroupSource = { provider };
+  if (typeof raw.include === "string" && raw.include.trim()) source.include = raw.include.trim();
+  if (typeof raw.exclude === "string" && raw.exclude.trim()) source.exclude = raw.exclude.trim();
+  if (raw.onlyFree !== undefined) source.onlyFree = !!raw.onlyFree;
+  return { source };
 }

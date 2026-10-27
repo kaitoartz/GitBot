@@ -44,14 +44,32 @@ A bot is a named, reusable agent preset.
 | `DELETE` | `/bots/:id` | Delete a bot and its threads |
 | `POST` | `/bots/:id/setup` | Set this machine's setup state. Body: `{ action: "complete" \| "reset" \| "fail" }` |
 | `GET` | `/routing-groups` | `{ groups: RoutingGroup[] }`, each with `spentToday` per model |
-| `POST` | `/routing-groups` | Create a group. Body: `{ name, models, onError?, dailyTokenBudgets? }` |
+| `POST` | `/routing-groups` | Create a group. Static: `{ name, models, onError?, dailyTokenBudgets?, matchers?, shortRetryMinutes? }`. Dynamic: `{ name, source: { provider, include?, exclude?, onlyFree? }, onError?, ... }` — the server pulls `models` from the provider's live `/v1/models` so the saved ids are always valid |
 | `GET` | `/routing-groups/:id` | `{ group }` with `spentToday` |
-| `PATCH` | `/routing-groups/:id` | Update any group field; newly added model ids are checked against the live catalog (existing entries stay editable if the gateway retires them) |
+| `PATCH` | `/routing-groups/:id` | Update any group field. `source` re-pulls `models` from the catalog (or `source: null` switches back to static, keeping the current snapshot); `models` checks newly added ids against the live catalog (existing entries stay editable if the gateway retires them) |
 | `DELETE` | `/routing-groups/:id` | Delete a group. `409` with `bots` when a bot still uses it |
 | `POST` | `/routing-groups/:id/reset` | Forget today's ledger for the group and send its threads back to the first model. `{ ok, group, models, threads }` |
+| `POST` | `/routing-groups/:id/refresh` | Repopulate a dynamic group's `models` from its provider's live catalog. `{ group, refreshed, count }`; static groups answer `refreshed: false, reason: "not_dynamic"`; a transient gateway outage keeps the last snapshot and returns `502` with the error |
 | `GET` | `/models/catalog?provider=magpie&q=` | Live model list from the provider's own `/v1/models`, not `opencode.json` |
 
 A bot joins a routing group by setting `model` to `group:<id>` instead of `provider/model`. The group rotates on quota, daily limit, provider failures (405/408/5xx) and unknown models (404). See [ROUTING-PLAN.md](ROUTING-PLAN.md).
+
+**RoutingGroup fields**
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | UUID, or a stable id when written by hand |
+| `name` | string | Required |
+| `models` | string[] | Ordered failover list of `provider/model`. Source of truth when static; a snapshot when `source` is set |
+| `onError` | `rotate` \| `fail` | Default `rotate` |
+| `dailyTokenBudgets` | `{ [provider/model]: number }` | Optional proactive limit per UTC day |
+| `matchers` | `{ [provider]: regex }` | Optional extra quota-error regexes |
+| `shortRetryMinutes` | number | Optional in-place wait for short `retry-after` |
+| `source` | `{ provider, include?, exclude?, onlyFree? }` | When set, the group is dynamic: `models` is auto-populated from the provider's live `/v1/models` on create, on refresh, and at server startup. `include`/`exclude` are case-insensitive regexes; `onlyFree` keeps ids that look free. A bad regex is ignored, never blocks saving |
+| `sourceStatus` | `{ at, count, error? }` | Read-only result of the last auto-refresh |
+| `createdAt`, `updatedAt` | ISO string | Timestamps |
+
+A dynamic group keeps its last snapshot if the gateway is unreachable, so a transient outage never empties the group mid-turn. The server re-syncs dynamic groups at startup and on a timer (default 10 min, `GITBOT_DYNAMIC_REFRESH_MS=0` disables the timer; the startup refresh always runs). Manual re-sync: `POST /routing-groups/:id/refresh`.
 
 **Bot fields**
 

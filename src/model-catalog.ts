@@ -170,6 +170,50 @@ export async function getProviderCatalog(providerID: string): Promise<CatalogRes
   }
 }
 
+/** Filters applied to a provider's live catalog when building a dynamic group. */
+export interface CatalogFilter {
+  /** Keep only ids matching this regex (case-insensitive). */
+  include?: string;
+  /** Drop ids matching this regex (case-insensitive). */
+  exclude?: string;
+  /** Keep only ids that look free (`:free` suffix or `/free` / `free` in the path). */
+  onlyFree?: boolean;
+}
+
+function safeRegex(pattern: string | undefined): RegExp | null {
+  if (!pattern) return null;
+  try {
+    return new RegExp(pattern, "i");
+  } catch {
+    // A bad pattern is the user's typo: filter as if nothing was asked.
+    return null;
+  }
+}
+
+/**
+ * Builds "provider/model" refs from a provider's live catalog, after filters.
+ * Returns the catalog source so callers can tell a live list from a cached one,
+ * and any fetch error so a refresh can report why it kept the old snapshot.
+ */
+export async function catalogModelRefs(
+  provider: string,
+  filter?: CatalogFilter,
+): Promise<{ refs: string[]; source: string; error?: string }> {
+  const cat = await getProviderCatalog(provider);
+  let ids = cat.models.slice();
+
+  if (filter?.onlyFree) {
+    ids = ids.filter((id) => /(^|\/)free|:free$|\/free\b/i.test(id));
+  }
+  const include = safeRegex(filter?.include);
+  if (include) ids = ids.filter((id) => include.test(id));
+  const exclude = safeRegex(filter?.exclude);
+  if (exclude) ids = ids.filter((id) => !exclude.test(id));
+
+  const refs = ids.map((id) => `${provider}/${id}`);
+  return { refs, source: cat.source, error: cat.error };
+}
+
 /**
  * Returns the refs a provider does not list. Providers whose catalog cannot be
  * read are skipped on purpose: a gateway being down must not block saving a

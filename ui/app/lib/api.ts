@@ -194,6 +194,17 @@ export function getModelCatalog(provider = "magpie", q?: string) {
   }>(`/models/catalog?${qs.toString()}`);
 }
 
+export type GroupSource = {
+  /** Provider id whose /v1/models feeds the group, e.g. "magpie". */
+  provider: string;
+  /** Keep only catalog ids matching this regex (case-insensitive). */
+  include?: string;
+  /** Drop catalog ids matching this regex (case-insensitive). */
+  exclude?: string;
+  /** Keep only ids that look free (`:free` suffix or `free` in the path). */
+  onlyFree?: boolean;
+};
+
 export type RoutingGroup = {
   id: string;
   name: string;
@@ -202,6 +213,10 @@ export type RoutingGroup = {
   dailyTokenBudgets?: Record<string, number>;
   matchers?: Record<string, string>;
   shortRetryMinutes?: number;
+  /** When set, models[] is auto-populated from the provider's live catalog. */
+  source?: GroupSource;
+  /** Result of the last auto-refresh. Read-only. */
+  sourceStatus?: { at: string; count: number; error?: string };
   createdAt?: string;
   updatedAt?: string;
   /** Only on GET /routing-groups: tokens spent today per model. */
@@ -210,9 +225,11 @@ export type RoutingGroup = {
 
 export type RoutingGroupInput = {
   name: string;
-  models: string[];
+  models?: string[];
   onError?: "rotate" | "fail";
   dailyTokenBudgets?: Record<string, number>;
+  /** Set to make the group dynamic; null clears it (back to static). */
+  source?: GroupSource | null;
 };
 
 export function getRoutingGroups() {
@@ -243,6 +260,13 @@ export function deleteRoutingGroup(id: string) {
 export function resetRoutingGroup(id: string) {
   return req<{ ok: boolean; group: string; models: number; threads: number }>(
     `/routing-groups/${encodeURIComponent(id)}/reset`,
+    { method: "POST" },
+  );
+}
+
+export function refreshRoutingGroup(id: string) {
+  return req<{ group: RoutingGroup; refreshed: boolean; count: number; reason?: string }>(
+    `/routing-groups/${encodeURIComponent(id)}/refresh`,
     { method: "POST" },
   );
 }

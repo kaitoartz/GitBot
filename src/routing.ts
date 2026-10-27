@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { join } from "path";
 import { dataDir, readCollection, writeCollection } from "./bot-store";
+import { catalogModelRefs } from "./model-catalog";
 
 // --- Routing groups -------------------------------------------------------
 //
@@ -26,8 +27,33 @@ export interface RoutingGroup {
   matchers?: Record<string, string>;
   /** Wait in place for a short `retry-after` before rotating. Off when unset. */
   shortRetryMinutes?: number;
+  /**
+   * When set, `models` is auto-populated from the provider's live catalog
+   * (/v1/models) on create, on refresh, and at server startup. The catalog is
+   * the source of truth, so a dynamic group never holds stale ids: it only
+   * keeps the last snapshot between refreshes so a gateway outage does not
+   * empty the group mid-turn.
+   */
+  source?: GroupSource;
+  /** Result of the last auto-refresh: count, time, and any error. Read-only. */
+  sourceStatus?: { at: string; count: number; error?: string };
   createdAt?: string;
   updatedAt?: string;
+}
+
+/**
+ * Declares a routing group as dynamic: its `models` list comes from a
+ * provider's own catalog, optionally narrowed. See `RoutingGroup.source`.
+ */
+export interface GroupSource {
+  /** Provider id whose /v1/models feeds the group, e.g. "magpie". */
+  provider: string;
+  /** Keep only catalog ids matching this regex (case-insensitive). */
+  include?: string;
+  /** Drop catalog ids matching this regex (case-insensitive). */
+  exclude?: string;
+  /** Keep only ids that look free (`:free` suffix or `free` in the path). */
+  onlyFree?: boolean;
 }
 
 export type NewRoutingGroup = Partial<RoutingGroup> & Pick<RoutingGroup, "name">;
@@ -59,6 +85,7 @@ export function createRoutingGroup(input: NewRoutingGroup): RoutingGroup {
     dailyTokenBudgets: input.dailyTokenBudgets,
     matchers: input.matchers,
     shortRetryMinutes: input.shortRetryMinutes,
+    source: input.source,
     createdAt: ts,
     updatedAt: ts,
   };
@@ -83,6 +110,75 @@ export function deleteRoutingGroup(id: string): boolean {
   if (remaining.length === groups.length) return false;
   writeCollection(GROUPS_FILE, remaining);
   return true;
+}
+
+// --- Dynamic groups (source-driven) -------------------------------------
+
+/** True when the group pulls its models from a provider's live catalog. */
+export function isDynamicGroup(group: RoutingGroup | undefined): group is RoutingGroup & { source: GroupSource } {
+  return !!group && !!group.source && typeof group.source.provider === "string" && !!group.source.provider;
+}
+
+/**
+ * Repopulates a dynamic group's `models` from its provider's live catalog.
+ * Returns the updated group, or undefined when the group is not dynamic or the
+ * catalog could not be reached (the existing snapshot is kept untouched on
+ * failure, so a transient gateway outage never empties the group mid-turn).
+ */
+export async function refreshGroupFromSource(
+  groupId: string,
+): Promise<{ group?: RoutingGroup; error?: string; reason?: string }> {
+  const group = getRoutingGroup(groupId);
+  if (!group) return { reason: "not_found" };
+  if (!isDynamicGroup(group)) return { reason: "not_dynamic", group };
+
+  const { refs, error } = await catalogModelRefs(group.source.provider, group.source);
+  if (error) {
+    // Catalog unreachable: record the failure on the group but keep the old
+    // snapshot, so threads already routed keep their model list.
+    updateRoutingGroup(groupId, {
+      sourceStatus: { at: now(), count: group.models.length, error },
+    });
+    return { group, error };
+  }
+  if (!refs.length) {
+    const msg = `Catalog for "${group.source.provider}" returned no models after filters`;
+    updateRoutingGroup(groupId, {
+      sourceStatus: { at: now(), count: 0, error: msg },
+    });
+    return { group, error: msg };
+  }
+
+  const updated = updateRoutingGroup(groupId, {
+    models: refs,
+    sourceStatus: { at: now(), count: refs.length },
+  });
+  return { group: updated };
+}
+
+/**
+ * Refreshes every dynamic group, in parallel. Safe to call on startup and on a
+ * timer: static groups are skipped, and a thrown error in one refresh never
+ * stops the others. Returns a short summary for logging.
+ */
+export async function refreshAllDynamicGroups(): Promise<{ refreshed: number; failed: number; skipped: number }> {
+  const groups = readCollection<RoutingGroup>(GROUPS_FILE).filter(isDynamicGroup);
+  if (!groups.length) return { refreshed: 0, failed: 0, skipped: 0 };
+
+  const results = await Promise.allSettled(
+    groups.map((g) => refreshGroupFromSource(g.id)),
+  );
+  let refreshed = 0;
+  let failed = 0;
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      if (r.value.error) failed += 1;
+      else refreshed += 1;
+    } else {
+      failed += 1;
+    }
+  }
+  return { refreshed, failed, skipped: 0 };
 }
 
 // --- Resolution -----------------------------------------------------------
