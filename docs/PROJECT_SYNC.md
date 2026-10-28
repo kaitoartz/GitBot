@@ -12,7 +12,7 @@
 
 #### 🚀 En Progreso (In Progress)
 
-- 🔵 **[GIT-ROUTING-5]** Fase 5 routing: dividir `rg_todos` en sub-grupos por tipo/costo (free vs paid, por sub-provider interno `auto/` `alibabacloud/` `qwen/` etc.) — `rg_todos` dinámico ya cubre "todos"; el siguiente paso es curar perfiles.
+- 🔵 **[GIT-ROUTING-5B]** Fase 5 routing: dividir `rg_todos` en sub-grupos por tipo/costo (free vs paid, por sub-provider interno `auto/` `alibabacloud/` `qwen/` etc.) — `rg_todos` dinámico ya cubre "todos"; el siguiente paso es curar perfiles.
 
 #### ⏳ Pendiente (Sprint Backlog / Próximo)
 
